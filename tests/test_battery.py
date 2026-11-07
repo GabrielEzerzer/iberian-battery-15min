@@ -11,6 +11,7 @@ from ib15.battery import (
     DURATIONS_H,
     ETA,
     POWER_MW,
+    RTE,
     SOC_START,
     SPECS,
     SolveError,
@@ -144,6 +145,41 @@ def test_cap2_limits_discharge_to_two_cycles(hours):
     for prices, dt in ((p, DT_15MIN), (hourly(p), DT_HOURLY)):
         assert solve_day(prices, dt, energy, NO_COST).discharged_mwh > 2 * energy + 0.1
         assert solve_day(prices, dt, energy, CAP2).discharged_mwh <= 2 * energy + TOL
+
+
+@pytest.mark.parametrize("hours", DURATIONS_H)
+def test_charge_plus_discharge_stays_within_power_at_negative_prices(hours):
+    # At a flat -100 the battery is paid to import, so it burns energy in the losses by charging
+    # and discharging at once, keeping sum(d) = RTE * sum(c) to end the day where it started.
+    # Without the shared limit, c = 1 and d = RTE in every period earns 100 * (1 - RTE) EUR an
+    # hour; with c + d <= 1 the best is sum(c) = periods / (1 + RTE), which earns less.
+    energy = POWER_MW * hours
+    for n, dt in ((96, DT_15MIN), (24, DT_HOURLY)):
+        r = solve_day(np.full(n, -100.0), dt, energy, NO_COST)
+        assert (r.charge + r.discharge).max() <= POWER_MW + 1e-9
+        unconstrained = 100 * (1 - RTE) * n * dt
+        shared = unconstrained / (1 + RTE)
+        assert r.net == pytest.approx(shared, abs=TOL)
+        assert r.net < unconstrained - 1
+        assert r.simultaneous > 0
+
+
+@pytest.mark.parametrize(
+    "hours, net15, neth",
+    [
+        (1, 216.35462488547944, 71.48959453084461),
+        (2, 315.15831395696404, 149.308553553445),
+        (4, 388.65213169650485, 174.91324627777712),
+    ],
+)
+def test_main_value_is_unchanged_by_the_shared_power_limit(hours, net15, neth):
+    # Values from the model before c + d <= POWER_MW was added. On these days main never
+    # charges and discharges in the same period, so the limit cannot bind.
+    p = random_day(np.random.default_rng(hours))
+    for prices, dt, expected in ((p, DT_15MIN, net15), (hourly(p), DT_HOURLY, neth)):
+        r = solve_day(prices, dt, hours, MAIN)
+        assert r.net == pytest.approx(expected, abs=1e-6)
+        assert r.simultaneous == 0
 
 
 def test_solver_failure_raises():

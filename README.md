@@ -56,7 +56,7 @@ The battery has 1 MW of power and 1, 2 or 4 hours of storage (1, 2 or 4 MWh). It
 
 The command writes to `$IB15_DATA_DIR/results/`:
 
-- `perfect_foresight_daily.parquet`: one row per delivery day, duration, specification and resolution, with gross revenue, degradation cost and net value in EUR per MW, MWh discharged, full cycles, and the number of periods in which the solution both charges and discharges.
+- `perfect_foresight_daily.parquet`: one row per delivery day, duration, specification and resolution, with gross revenue, degradation cost and net value in EUR per MW, MWh discharged, full cycles, and the number of periods in which the solution both charges and discharges. Charging and discharging share the 1 MW converter, so together they never exceed 1 MW in a period; a period with both stands for the battery alternating between them within it, which burns energy in the losses and is worth doing only at negative prices.
 - `perfect_foresight_summary.csv`: for each duration and specification, the net and gross value over the whole sample at both resolutions, the 15-minute uplift in kEUR/MW, EUR/MW a day and percent, and the mean cycles a day.
 - `perfect_foresight_meta.json`: the battery parameters, the dates covered, the solve time and the git commit.
 

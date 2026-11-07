@@ -4,8 +4,12 @@ resolution.
 Each delivery day is a separate linear programme solved with HiGHS. Per period t the battery
 charges c_t and discharges d_t MW (both in [0, POWER_MW]); the energy in it evolves as
 s_t = s_{t-1} + ETA * c_t * dt - d_t * dt / ETA, stays within [0, energy capacity], and starts
-and ends the day at SOC_START of capacity. The objective is gross revenue
-sum(price_t * (d_t - c_t) * dt) minus a degradation cost per MWh discharged at the grid side.
+and ends the day at SOC_START of capacity. Both c_t and d_t can be positive in the same period:
+that stands for the battery alternating between charging and discharging within the period,
+which burns energy in the efficiency losses (worth doing at negative prices). A single
+converter can alternate only up to its rated power in total, so c_t + d_t <= POWER_MW. The
+objective is gross revenue sum(price_t * (d_t - c_t) * dt) minus a degradation cost per MWh
+discharged at the grid side.
 The hourly case decides one c and d per hour at the hourly price (the mean of the hour's four
 quarter-hours), so its schedule is feasible at 15 minutes and earns the same there.
 """
@@ -85,10 +89,13 @@ def solve_day(prices, dt: float, energy_mwh: float, spec: Spec) -> Dispatch:
     bounds = [(0.0, POWER_MW)] * (2 * n) + [(0.0, energy_mwh)] * (n - 1) + [(s0, s0)]
     # linprog minimises: charging costs p*dt, discharging earns (p - cost)*dt.
     obj = np.concatenate([p * dt, -(p - spec.cost_per_mwh) * dt, np.zeros(n)])
-    a_ub = b_ub = None
+    # c_t + d_t <= POWER_MW: the converter's rated power is shared within each period.
+    a_ub = sparse.hstack([eye, eye, sparse.csr_matrix((n, n))], format="csr")
+    b_ub = np.full(n, POWER_MW)
     if spec.max_cycles is not None:
-        a_ub = sparse.csr_matrix(np.concatenate([np.zeros(n), np.full(n, dt), np.zeros(n)]))
-        b_ub = [spec.max_cycles * energy_mwh]
+        cycles = sparse.csr_matrix(np.concatenate([np.zeros(n), np.full(n, dt), np.zeros(n)]))
+        a_ub = sparse.vstack([a_ub, cycles], format="csr")
+        b_ub = np.append(b_ub, spec.max_cycles * energy_mwh)
     res = linprog(obj, A_ub=a_ub, b_ub=b_ub, A_eq=a_eq, b_eq=b_eq, bounds=bounds, method="highs")
     if res.status != 0:
         raise SolveError(
@@ -108,6 +115,8 @@ def solve_day(prices, dt: float, energy_mwh: float, spec: Spec) -> Dispatch:
         degradation=degradation,
         net=gross - degradation,
         discharged_mwh=discharged,
+        # Periods in which the battery time-shares its converter between charging and
+        # discharging (both positive, together at most POWER_MW).
         simultaneous=int(np.sum((c > SIMULTANEOUS_TOL) & (d > SIMULTANEOUS_TOL))),
     )
 
