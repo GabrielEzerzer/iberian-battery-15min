@@ -26,6 +26,9 @@ def test_reads_values_and_version_from_file():
     assert d.day == date(2025, 10, 1)
     assert d.rows[0] == (1, 105.1, 105.1)
     assert d.rows[-1] == (96, 101.52, 101.52)
+    # Rows where Portugal and Spain differ pin the column order: (period, price_pt, price_es).
+    assert d.rows[39] == (40, 60.87, 60.0)
+    assert d.rows[72] == (73, 60.0, 59.07)
     assert read_day(FIXTURES / "marginalpdbc_20251030.3").version == 3
 
 

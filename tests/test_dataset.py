@@ -13,7 +13,13 @@ MAR = ["marginalpdbc_20260328.1", "marginalpdbc_20260329.1", "marginalpdbc_20260
 GOOD = fixture_text("marginalpdbc_20251001.1")
 
 
+def day_of(name):
+    return datetime.strptime(name.split("_")[1][:8], "%Y%m%d").date()
+
+
 def built(data_dir, names):
+    """Build from the named fixtures, preceded by a file for every day from GO_LIVE."""
+    data_dir.fill(day_of(names[0]))
     for n in names:
         data_dir.add(n)
     build(data_dir)
@@ -48,7 +54,8 @@ def test_utc_starts_unique_and_15min_apart_across_dst_days(data_dir, names, dst_
 def test_hourly_is_mean_of_its_four_quarter_hours(data_dir, names):
     q, h, _ = built(data_dir, names)
     assert list(h.columns) == list(q.columns)
-    for d, qd in q.groupby("delivery_date"):
+    named = q[q["delivery_date"].isin([day_of(n) for n in names])]
+    for d, qd in named.groupby("delivery_date"):
         hd = h[h["delivery_date"] == d].reset_index(drop=True)
         assert len(hd) == len(qd) / 4
         assert hd["period"].tolist() == list(range(1, len(hd) + 1))
@@ -61,8 +68,8 @@ def test_hourly_is_mean_of_its_four_quarter_hours(data_dir, names):
 
 def test_coverage(data_dir):
     q, _, cov = built(data_dir, OCT)
-    assert cov["date_range"] == {"start": "2025-10-25", "end": "2025-10-27"}
-    assert (cov["days"], cov["periods_15min"], cov["hours"]) == (3, 292, 73)
+    assert cov["date_range"] == {"start": "2025-10-01", "end": "2025-10-27"}
+    assert (cov["days"], cov["periods_15min"], cov["hours"]) == (27, 26 * 96 + 100, 649)
     assert cov["days_not_96_periods"] == {"2025-10-26": {"expected": 100, "actual": 100}}
     assert cov["missing_periods"] == 0 and cov["duplicate_periods"] == 0
     assert cov["days_not_version_1"] == {}
@@ -78,7 +85,16 @@ def test_coverage(data_dir):
 def test_coverage_records_non_v1_day(data_dir):
     q, _, cov = built(data_dir, ["marginalpdbc_20251030.3"])
     assert cov["days_not_version_1"] == {"2025-10-30": 3}
-    assert set(q["source_version"]) == {3}
+    assert set(q[q["delivery_date"] == date(2025, 10, 30)]["source_version"]) == {3}
+    assert set(q[q["delivery_date"] != date(2025, 10, 30)]["source_version"]) == {1}
+
+
+def test_es_and_pt_prices_land_in_their_columns(data_dir):
+    q, _, _ = built(data_dir, ["marginalpdbc_20251001.1"])
+    # The fixture's period 40 is PT 60.87, ES 60; period 73 is PT 60, ES 59.07.
+    rows = q.set_index("period")
+    assert (rows.loc[40, "price_es"], rows.loc[40, "price_pt"]) == (60.0, 60.87)
+    assert (rows.loc[73, "price_es"], rows.loc[73, "price_pt"]) == (59.07, 60.0)
 
 
 def _with_period_5(edit):
@@ -119,6 +135,7 @@ def test_bad_file_fails_build(data_dir, text, message):
 
 
 def test_gap_in_days_fails_build(data_dir):
+    data_dir.fill(date(2025, 10, 25))
     data_dir.add("marginalpdbc_20251025.1")
     data_dir.add("marginalpdbc_20251027.1")
     with pytest.raises(
@@ -130,7 +147,28 @@ def test_gap_in_days_fails_build(data_dir):
 def test_two_versions_of_one_day_fail_build(data_dir):
     data_dir.add("marginalpdbc_20251001.1")
     data_dir.add("marginalpdbc_20251001.2", GOOD)
-    with pytest.raises(BuildError, match="more than one version"):
+    with pytest.raises(
+        BuildError,
+        match="more than one version of one day: marginalpdbc_20251001.1, marginalpdbc_20251001.2",
+    ):
+        build(data_dir)
+
+
+def test_series_starting_after_go_live_fails_build(data_dir):
+    for n in OCT:
+        data_dir.add(n)
+    with pytest.raises(
+        BuildError,
+        match="series must start on 2025-10-01, but the first raw file is marginalpdbc_20251025.1",
+    ):
+        build(data_dir)
+    assert not (data_dir / "dataset").exists()
+
+
+def test_impossible_date_in_file_name_fails_build(data_dir):
+    data_dir.add("marginalpdbc_20251001.1")
+    data_dir.add("marginalpdbc_20251340.1", GOOD)
+    with pytest.raises(BuildError, match="marginalpdbc_20251340.1: file name has an invalid date"):
         build(data_dir)
 
 

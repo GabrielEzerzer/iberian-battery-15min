@@ -29,7 +29,7 @@ def _download(args) -> int:
         raise SystemExit(f"error: --end {end} is before --start {start}")
     r = omie.download(data_dir / "raw" / "omie", start, end)
     print(
-        f"saved {len(r.saved)}, already present {len(r.skipped)}, "
+        f"saved {len(r.saved)}, updated {len(r.updated)}, up to date {len(r.up_to_date)}, "
         f"not published yet {len(r.not_published)}, errors {len(r.errors)}"
     )
     for d, v in r.saved:

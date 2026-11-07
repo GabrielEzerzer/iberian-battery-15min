@@ -9,6 +9,7 @@ import pandas as pd
 
 from ib15.omie import (
     FILE_RE,
+    GO_LIVE,
     DayFile,
     OmieFormatError,
     expected_periods,
@@ -32,6 +33,18 @@ def load_days(raw_dir: Path) -> list[DayFile]:
     if not paths:
         raise BuildError(f"no raw OMIE files in {raw_dir}")
     errors, days = [], []
+    by_day: dict[str, list[str]] = {}
+    for path in paths:
+        by_day.setdefault(FILE_RE.match(path.name).group(1), []).append(path.name)
+    for names in by_day.values():
+        if len(names) > 1:
+            errors.append(f"more than one version of one day: {', '.join(names)}")
+    first = min(by_day)
+    if first > f"{GO_LIVE:%Y%m%d}":
+        errors.append(
+            f"series must start on {GO_LIVE}, but the first raw file is {by_day[first][0]};"
+            " download the missing days"
+        )
     for path in paths:
         try:
             days.append(read_day(path))
@@ -39,9 +52,7 @@ def load_days(raw_dir: Path) -> list[DayFile]:
             errors.append(str(e))
     days.sort(key=lambda d: d.day)
     for prev, cur in zip(days, days[1:], strict=False):
-        if cur.day == prev.day:
-            errors.append(f"{cur.day}: more than one version (v{prev.version} and v{cur.version})")
-        elif cur.day - prev.day != timedelta(days=1):
+        if cur.day != prev.day and cur.day - prev.day != timedelta(days=1):
             errors.append(f"gap in day sequence: {prev.day} is followed by {cur.day}")
     if errors:
         raise BuildError("\n".join(errors))

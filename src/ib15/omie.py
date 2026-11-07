@@ -59,10 +59,15 @@ def http_get(url: str) -> bytes | None:
         raise
 
 
+class DownloadError(Exception):
+    pass
+
+
 @dataclass
 class DownloadResult:
     saved: list[tuple[date, int]]
-    skipped: list[date]
+    updated: list[tuple[date, int, int]]  # (day, old version, new version)
+    up_to_date: list[date]
     not_published: list[date]
     errors: list[tuple[date, str]]
 
@@ -78,58 +83,86 @@ def download(
 ) -> DownloadResult:
     """Download each day's file from start to end (inclusive) into raw_dir, unchanged.
 
-    Sequential, with ``pause`` seconds between requests. A day that already has a file in
-    raw_dir is skipped. For each day, versions 1..MAX_VERSION are tried in order and the first
-    that exists is saved under its own name, so the file name records the version. A day after
-    today (Madrid) that has no file yet is reported as not published, not as an error; days
-    more than one day ahead are not requested at all.
+    Sequential, with ``pause`` seconds between requests. OMIE serves only the latest version
+    of a day's file, so for a day already in raw_dir at version v, v is requested again: if it
+    is still served the day is up to date; if not, v+1..MAX_VERSION are tried and the first
+    served replaces the old file. A day not yet in raw_dir tries 1..MAX_VERSION in order. The
+    file name records the version. Every response is validated with the same parser the build
+    uses before it is saved; a bad one is an error and nothing is written. A day after today
+    (Madrid) that has no file yet is reported as not published, not as an error; days more
+    than one day ahead are not requested at all.
     """
     fetch = fetch or http_get
     today = today or madrid_today()
     raw_dir.mkdir(parents=True, exist_ok=True)
-    have = {m.group(1) for p in raw_dir.iterdir() if (m := FILE_RE.match(p.name))}
-    result = DownloadResult([], [], [], [])
-    first_request = True
+    have: dict[str, list[Path]] = {}
+    for p in raw_dir.iterdir():
+        if m := FILE_RE.match(p.name):
+            have.setdefault(m.group(1), []).append(p)
+    result = DownloadResult([], [], [], [], [])
+    requests = 0
+
+    def get(name: str) -> bytes | None:
+        nonlocal requests
+        if requests:
+            time.sleep(pause)
+        requests += 1
+        try:
+            return fetch(URL.format(name=name))
+        except Exception as e:  # noqa: BLE001 - reported per day at the end
+            raise DownloadError(f"{name}: {type(e).__name__}: {e}") from e
+
+    def first_served(day: date, versions: range) -> tuple[int, bytes] | None:
+        for version in versions:
+            body = get(file_name(day, version))
+            if body is not None:
+                return version, body
+        return None
+
+    def save(day: date, version: int, body: bytes) -> None:
+        name = file_name(day, version)
+        parse_day(name, body)  # raises OmieFormatError before anything is written
+        tmp = raw_dir / (name + ".part")
+        tmp.write_bytes(body)
+        tmp.replace(raw_dir / name)
 
     day = start
     while day <= end:
-        if f"{day:%Y%m%d}" in have:
-            result.skipped.append(day)
-        elif day > today + timedelta(days=1):
-            result.not_published.append(day)
-        else:
-            outcome = None
-            for version in range(1, MAX_VERSION + 1):
-                if not first_request:
-                    time.sleep(pause)
-                first_request = False
-                name = file_name(day, version)
-                try:
-                    body = fetch(URL.format(name=name))
-                except Exception as e:  # noqa: BLE001 - reported per day at the end
-                    outcome = ("error", f"{name}: {type(e).__name__}: {e}")
-                    break
-                if body is None:
-                    continue
-                if not body.startswith(HEADER.encode("latin-1")):
-                    outcome = ("error", f"{name}: response is not an OMIE marginalpdbc file")
-                    break
-                tmp = raw_dir / (name + ".part")
-                tmp.write_bytes(body)
-                tmp.replace(raw_dir / name)
-                outcome = ("saved", version)
-                break
-            if outcome is None:
-                if day > today:
-                    result.not_published.append(day)
+        on_disk = have.get(f"{day:%Y%m%d}")
+        try:
+            if on_disk:
+                old = max(int(FILE_RE.match(p.name).group(2)) for p in on_disk)
+                if get(file_name(day, old)) is not None:
+                    result.up_to_date.append(day)
                 else:
-                    result.errors.append((day, f"no version 1..{MAX_VERSION} found (all 404)"))
-            elif outcome[0] == "saved":
-                result.saved.append((day, outcome[1]))
-                print(f"{day} saved version {outcome[1]}")
+                    found = first_served(day, range(old + 1, MAX_VERSION + 1))
+                    if found is None:
+                        raise DownloadError(
+                            f"{file_name(day, old)} is no longer served and no version"
+                            f" {old + 1}..{MAX_VERSION} was found"
+                        )
+                    version, body = found
+                    save(day, version, body)
+                    for p in on_disk:
+                        p.unlink()
+                    result.updated.append((day, old, version))
+                    print(f"{day} updated version {old} -> {version}")
+            elif day > today + timedelta(days=1):
+                result.not_published.append(day)
             else:
-                result.errors.append((day, outcome[1]))
-                print(f"{day} ERROR {outcome[1]}")
+                found = first_served(day, range(1, MAX_VERSION + 1))
+                if found is None:
+                    if day > today:
+                        result.not_published.append(day)
+                    else:
+                        raise DownloadError(f"no version 1..{MAX_VERSION} found (all 404)")
+                else:
+                    save(day, *found)
+                    result.saved.append((day, found[0]))
+                    print(f"{day} saved version {found[0]}")
+        except (DownloadError, OmieFormatError) as e:
+            result.errors.append((day, str(e)))
+            print(f"{day} ERROR {e}")
         day += timedelta(days=1)
     return result
 
@@ -160,16 +193,23 @@ def _price(text: str, name: str, lineno: int) -> float:
 
 def read_day(path: Path) -> DayFile:
     """Parse and validate one raw file. Raises OmieFormatError with the file name on any fault."""
-    name = path.name
+    return parse_day(path.name, path.read_bytes())
+
+
+def parse_day(name: str, data: bytes) -> DayFile:
+    """Parse and validate one file's name and bytes. Raises OmieFormatError on any fault."""
     m = FILE_RE.match(name)
     if not m:
         raise OmieFormatError(f"{name}: unexpected file name")
-    day = datetime.strptime(m.group(1), "%Y%m%d").date()
+    try:
+        day = datetime.strptime(m.group(1), "%Y%m%d").date()
+    except ValueError:
+        raise OmieFormatError(f"{name}: file name has an invalid date") from None
     version = int(m.group(2))
     if day < GO_LIVE:
         raise OmieFormatError(f"{name}: day {day} is before {GO_LIVE}, out of scope")
 
-    lines = path.read_bytes().decode("latin-1").splitlines()
+    lines = data.decode("latin-1").splitlines()
     if not lines or lines[0].strip() != HEADER:
         got = lines[0].strip() if lines else ""
         raise OmieFormatError(f"{name}: unexpected header {got!r}, expected {HEADER!r}")
