@@ -23,4 +23,27 @@ uv run ib15 build
 - `prices_hourly.parquet`: an hourly series constructed as the mean of each hour's four quarter-hours. It is not OMIE's own hourly product.
 - `coverage.json`: date range, counts, DST days, days that used a later file version, price summary and the git commit of the build.
 
+## Weather forecasts
+
+`ib15` also downloads archived weather forecasts as they were issued before each day's bid, and joins them to the prices.
+
+```
+uv run ib15 download weather    # optional: --start YYYY-MM-DD --end YYYY-MM-DD (UTC dates)
+uv run ib15 build weather       # after `ib15 build`
+```
+
+The source is Open-Meteo's Previous Runs API (free for non-commercial use, no key). It serves one fixed model, ECMWF IFS 0.25° (`ecmwf_ifs025`), at the `_previous_day2` lead: the forecast made at least 48 hours before each hour. The variables are hourly `temperature_2m` (°C), `wind_speed_100m` (m/s) and `shortwave_radiation` (W/m²). There are ten locations in mainland Spain: Madrid, Barcelona, Valencia, Sevilla, Zaragoza, Burgos, Lugo, Badajoz, Ciudad Real and Albacete. The coordinates are in `src/ib15/weather.py`.
+
+Bids for delivery day D close at 12:00 Madrid time on D-1. Every forecast value used for D comes from a model run that ECMWF had published by about 08:00 UTC on D-1. The newest is the 00 UTC run of D-1, which the late hours of D use through Open-Meteo's interpolation from 3-hourly to hourly values. That is at least two hours before the deadline. The one-day lead (`_previous_day1`) would break this rule. The evidence is in the docstring of `src/ib15/weather.py`, and `build weather` checks the rule for every hour.
+
+`download weather` makes one request per location and calendar month and saves each response unchanged to `$IB15_DATA_DIR/raw/openmeteo/` as `<location>.<model>.<start>.<end>.json`. It pauses between requests and validates each response before saving it. A month already saved is skipped, unless it ends less than two days before today: then it is fetched again, because its last hours may not be filled in yet. The default range starts on 2025-09-30, because the first price day begins at 22:00 UTC that day, and ends on the latest day in `raw/omie`. Any failed request is listed at the end and the command exits non-zero.
+
+`build weather` reads `prices_15min.parquet` and the raw weather files. It stops with an error if any location has a missing hour, a null value, a duplicate hour or a range that does not cover the prices, if a file has an unexpected model or variable, or if any hour would break the bid-time rule. Otherwise it writes to `$IB15_DATA_DIR/dataset/`:
+
+- `weather_hourly.parquet`: one row per UTC hour and location, for every hour of the price range. Each row describes the hour that starts at `valid_time_utc`. Temperature and wind are the values at that time. Radiation is the mean over that hour; Open-Meteo labels that mean with the hour's end.
+- `prices_weather_15min.parquet`: the rows of `prices_15min.parquet`, each with the weather of the UTC hour containing its start, one column per variable and location (`temp_madrid`, `wind100_zaragoza`, `ghi_badajoz`, ...).
+- `weather_coverage.json`: model, lead, locations, hours expected and present per location, nulls, units, the smallest margin before the bid deadline and the git commit.
+
+## Tests
+
 Run the tests with `uv run pytest`. They run offline.
