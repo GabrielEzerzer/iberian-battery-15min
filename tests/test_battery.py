@@ -412,6 +412,23 @@ def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(tmp_path
     assert files_in(tmp_path) == {"a": b"newest a", "b": b"newest b"}
 
 
+def test_a_failed_rename_removes_a_new_file_with_no_previous_version(tmp_path, monkeypatch):
+    # b is new (no previous version) and goes in first; then putting a in place fails.
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_text("old a")
+    real_replace = Path.replace
+
+    def replace(self, target):
+        if self.name == "a.part" and Path(target) == a:
+            raise OSError("rename failed")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    with pytest.raises(OSError, match="rename failed"):
+        _write_all({b: lambda t: t.write_text("new b"), a: lambda t: t.write_text("new a")})
+    assert files_in(tmp_path) == {"a": b"old a"}
+
+
 @pytest.fixture(scope="module")
 def sensitivity_daily():
     rng = np.random.default_rng(11)
