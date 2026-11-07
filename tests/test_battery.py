@@ -1,6 +1,9 @@
+import errno
 import json
 import math
+import sys
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -18,6 +21,7 @@ from ib15.battery import (
     SPECS,
     SolveError,
     Spec,
+    _write_all,
     cost_sensitivity,
     daily_values,
     solve_day,
@@ -270,6 +274,12 @@ def test_cli_writes_daily_summary_and_meta(tmp_path):
     assert meta["date_range"] == {"start": "2025-10-01", "end": "2025-10-04"}
     assert meta["days"] == 4 and meta["round_trip_efficiency"] == 0.88
     assert meta["cost_sensitivity_eur_per_mwh_discharged"] == [0.0, 10.0, 20.0, 30.0, 40.0]
+    # Every spec in the daily file, the sensitivity's cost_* ones included, is described in meta.
+    assert set(meta["specs"]) == set(daily["spec"])
+    assert meta["specs"]["cost_10"] == {
+        "cost_eur_per_mwh_discharged": 10.0,
+        "max_cycles_per_day": None,
+    }
     sens = pd.read_csv(out / "perfect_foresight_cost_sensitivity.csv")
     assert list(zip(sens["duration_h"], sens["cost_eur_per_mwh"], strict=True)) == [
         (h, c) for h in DURATIONS_H for c in SENSITIVITY_COSTS
@@ -284,12 +294,22 @@ RESULT_FILES = [
 ]
 
 
+def previous_results(out):
+    """Result files with contents of their own, as a previous run left them; returns the bytes."""
+    out.mkdir(exist_ok=True)
+    for name in RESULT_FILES:
+        (out / name).write_text(f"previous {name}")
+    return {name: (out / name).read_bytes() for name in RESULT_FILES}
+
+
+def files_in(folder):
+    return {p.name: p.read_bytes() for p in folder.iterdir()}
+
+
 def test_a_failed_write_leaves_the_previous_results_intact(tmp_path, monkeypatch):
     data_dir = dataset_dir(tmp_path, ndays=1)
     out = data_dir / "results"
-    out.mkdir()
-    for name in RESULT_FILES:
-        (out / name).write_text("previous run")
+    previous = previous_results(out)
 
     def fail(*args, **kwargs):
         raise OSError("disk full")
@@ -298,15 +318,98 @@ def test_a_failed_write_leaves_the_previous_results_intact(tmp_path, monkeypatch
     monkeypatch.setattr(pd.DataFrame, "to_csv", fail)
     with pytest.raises(OSError, match="disk full"):
         main(["perfect-foresight", "--data-dir", str(data_dir)])
-    for name in RESULT_FILES:
-        assert (out / name).read_text() == "previous run"
-    assert (out / "perfect_foresight_daily.parquet.part").exists()
+    assert files_in(out) == previous  # the daily .part is removed too
 
-    # The next run overwrites the leftover .part and leaves only the results.
+    # The next run leaves only the results.
     monkeypatch.undo()
     assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
     assert sorted(p.name for p in out.iterdir()) == RESULT_FILES
     assert len(pd.read_parquet(out / "perfect_foresight_daily.parquet")) > 0
+
+
+@pytest.mark.parametrize("locked", RESULT_FILES)
+def test_a_file_that_cannot_be_replaced_leaves_the_previous_results(
+    tmp_path, monkeypatch, capsys, locked
+):
+    # On Windows a file another program holds open (a CSV open in Excel) can be neither renamed
+    # nor replaced. Here every rename to or from the locked file fails the same way, on any OS.
+    data_dir = dataset_dir(tmp_path, ndays=1)
+    out = data_dir / "results"
+    previous = previous_results(out)
+    replace = Path.replace
+
+    def locked_replace(self, target):
+        if out / locked in (self, Path(target)):
+            raise PermissionError(errno.EACCES, "used by another process")
+        return replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", locked_replace)
+    assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1
+    assert f"cannot replace {out / locked}" in capsys.readouterr().err
+    assert files_in(out) == previous  # byte for byte, and no .part or .prev left
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="only Windows refuses to rename or replace a file another program has open",
+)
+def test_a_results_file_open_in_another_program_leaves_the_previous_results(tmp_path, capsys):
+    data_dir = dataset_dir(tmp_path, ndays=1)
+    out = data_dir / "results"
+    previous = previous_results(out)
+    summary = out / "perfect_foresight_summary.csv"
+    # Python's open() on Windows does not let others delete or rename the file, as Excel does.
+    with open(summary):
+        assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1
+    assert f"cannot replace {summary}" in capsys.readouterr().err
+    assert files_in(out) == previous
+    # Once the file is closed, the next run replaces the whole set.
+    assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
+    assert sorted(p.name for p in out.iterdir()) == RESULT_FILES
+    assert summary.read_bytes() != previous[summary.name]
+
+
+# What a run killed at each step leaves behind, for two files written in the order a, b, and
+# which set a later run that fails should leave in place: the files from before the killed run,
+# unless that run had put all its new files in place.
+KILLED = {
+    "while writing the parts": ({"a": "old a", "b": "old b", "a.part": "half"}, "old"),
+    "while moving the old files aside": (
+        {"a.prev": "old a", "b": "old b", "a.part": "new a", "b.part": "new b"},
+        "old",
+    ),
+    "while putting the new files in place": (
+        {"a": "new a", "a.prev": "old a", "b.prev": "old b", "b.part": "new b"},
+        "old",
+    ),
+    "while deleting the old files": ({"a": "new a", "b": "new b", "b.prev": "old b"}, "new"),
+}
+
+
+@pytest.mark.parametrize("leftovers, kept", KILLED.values(), ids=KILLED.keys())
+def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(tmp_path, leftovers, kept):
+    a, b = tmp_path / "a", tmp_path / "b"
+
+    def leave(files):
+        for p in tmp_path.iterdir():
+            p.unlink()
+        for name, text in files.items():
+            (tmp_path / name).write_text(text)
+
+    def write(text):
+        return lambda t: t.write_text(text)
+
+    def fail(t):
+        raise OSError("disk full")
+
+    leave(leftovers)
+    with pytest.raises(OSError, match="disk full"):
+        _write_all({a: write("newest a"), b: fail})
+    assert files_in(tmp_path) == {"a": f"{kept} a".encode(), "b": f"{kept} b".encode()}
+
+    leave(leftovers)
+    _write_all({a: write("newest a"), b: write("newest b")})
+    assert files_in(tmp_path) == {"a": b"newest a", "b": b"newest b"}
 
 
 @pytest.fixture(scope="module")
@@ -352,12 +455,17 @@ def test_15min_net_is_at_least_hourly_at_every_cost(sensitivity_daily):
 def test_percent_uplift_is_nan_when_the_hourly_total_is_zero():
     # Each hour alternates 0 and 100 by quarter-hour: the hourly price is a flat 50, so the
     # hourly value is zero, while the 15-minute prices pay for cycling.
-    q, h = price_tables([np.tile([0.0, 100.0], 48)])
-    summary = summarise(daily_values(q, h))
+    daily = daily_values(*price_tables([np.tile([0.0, 100.0], 48)]))
+    summary = summarise(daily)
     assert (summary["net_hourly_keur_per_mw"] == 0).all()
     assert (summary["net_15min_keur_per_mw"] > 0).all()
     assert summary["net_uplift_pct"].map(math.isnan).all()
     assert summary["gross_uplift_pct"].map(math.isnan).all()
+    # Solver noise around zero counts as zero rather than giving a huge percentage.
+    daily.loc[daily["resolution"] == "hourly", ["net_eur_per_mw", "gross_eur_per_mw"]] += 1e-9
+    noisy = summarise(daily)
+    assert noisy["net_uplift_pct"].map(math.isnan).all()
+    assert noisy["gross_uplift_pct"].map(math.isnan).all()
 
 
 def test_hourly_prices_that_are_not_the_mean_are_rejected(tmp_path, capsys):

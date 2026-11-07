@@ -14,6 +14,7 @@ The hourly case decides one c and d per hour at the hourly price (the mean of th
 quarter-hours), so its schedule is feasible at 15 minutes and earns the same there.
 """
 
+import contextlib
 import json
 import math
 import time
@@ -176,7 +177,8 @@ def daily_values(q: pd.DataFrame, h: pd.DataFrame) -> pd.DataFrame:
 
 def _compare(daily: pd.DataFrame, hours: int, spec: Spec) -> dict:
     """Sample totals at both resolutions for one (duration_h, spec), the 15-minute uplift and
-    mean cycles a day. Percent uplift is NaN when the hourly total is zero."""
+    mean cycles a day. Percent uplift is NaN when the hourly total is zero (within 1e-6 EUR/MW,
+    so solver noise around zero does not give a huge percentage)."""
     g = daily[(daily["duration_h"] == hours) & (daily["spec"] == spec.name)]
     r15 = g[g["resolution"] == "15min"].set_index("delivery_date")
     rh = g[g["resolution"] == "hourly"].set_index("delivery_date")
@@ -191,7 +193,9 @@ def _compare(daily: pd.DataFrame, hours: int, spec: Spec) -> dict:
         row[f"{label}_hourly_keur_per_mw"] = vh / 1000
         row[f"{label}_uplift_keur_per_mw"] = (v15 - vh) / 1000
         row[f"{label}_uplift_eur_per_mw_day"] = (v15 - vh) / days
-        row[f"{label}_uplift_pct"] = 100 * (v15 - vh) / vh if vh != 0 else math.nan
+        row[f"{label}_uplift_pct"] = (
+            math.nan if math.isclose(vh, 0, abs_tol=1e-6) else 100 * (v15 - vh) / vh
+        )
     row["degradation_15min_keur_per_mw"] = r15["degradation_eur_per_mw"].sum() / 1000
     row["degradation_hourly_keur_per_mw"] = rh["degradation_eur_per_mw"].sum() / 1000
     row["cycles_per_day_15min"] = r15["cycles"].mean()
@@ -223,15 +227,59 @@ def cost_sensitivity(daily: pd.DataFrame) -> pd.DataFrame:
 
 
 def _write_all(files: dict[Path, Callable[[Path], object]]) -> None:
-    """Write every file to a ``.part`` name beside it, then rename them all, so a failure while
-    writing leaves the previous set intact. A ``.part`` left by a failed run is overwritten."""
-    parts = []
-    for path, write in files.items():
-        tmp = path.with_name(path.name + ".part")
-        write(tmp)
-        parts.append((tmp, path))
-    for tmp, path in parts:
-        tmp.replace(path)
+    """Replace a set of files all together, or leave the previous set as it was.
+
+    Every file is written to ``<name>.part`` first. Then each existing file is moved aside to
+    ``<name>.prev``, so a file another program holds open (on Windows, a CSV open in Excel)
+    fails before anything new is in place. Only then are the parts renamed into place and the
+    ``.prev`` files deleted. On any failure the files moved aside are moved back and the parts
+    are removed.
+    """
+    part = {p: p.with_name(p.name + ".part") for p in files}
+    prev = {p: p.with_name(p.name + ".prev") for p in files}
+    # Files left by a run that was killed. While any of its parts is left it had not put all its
+    # files in place, so its .prev files are the previous set and go back; otherwise they are
+    # stale. shortcut: a file with no previous version that such a run had already put in place
+    # stays; a journal file would fix that if it ever matters.
+    killed_before_done = any(t.exists() for t in part.values())
+    for p, old in prev.items():
+        if not old.exists():
+            continue
+        if killed_before_done:
+            old.replace(p)
+        else:
+            old.unlink()
+    moved, placed = [], []
+    try:
+        for p, write in files.items():
+            write(part[p])
+        for p in files:
+            if p.exists():
+                try:
+                    p.replace(prev[p])
+                except PermissionError as e:
+                    raise BuildError(
+                        f"cannot replace {p}: {e.strerror}. If it is open in another program, "
+                        "close it and run again. The previous results are unchanged."
+                    ) from e
+                moved.append(p)
+        for p in files:
+            part[p].replace(p)
+            placed.append(p)
+    except BaseException:
+        # The parts go last: while one is left, the next run knows this one did not finish.
+        for p in placed:
+            if p not in moved:
+                p.unlink()
+        for p in moved:
+            prev[p].replace(p)
+        for t in part.values():
+            t.unlink(missing_ok=True)
+        raise
+    for p in moved:
+        # The new set is in place; a .prev that cannot be deleted now is deleted by the next run.
+        with contextlib.suppress(OSError):
+            prev[p].unlink()
 
 
 def perfect_foresight(data_dir: Path) -> dict:
@@ -261,7 +309,7 @@ def perfect_foresight(data_dir: Path) -> dict:
                 "cost_eur_per_mwh_discharged": s.cost_per_mwh,
                 "max_cycles_per_day": s.max_cycles,
             }
-            for s in SPECS
+            for s in SOLVED_SPECS
         },
         "cost_sensitivity_eur_per_mwh_discharged": list(SENSITIVITY_COSTS),
         "hourly": "one charge and discharge power per hour at the hourly price (mean of quarters)",
