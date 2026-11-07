@@ -568,7 +568,7 @@ def fig_sensitivity(s: pd.DataFrame, out: Path) -> list[str]:
     for ax in (a, b):
         ax.set_xlabel("wear cost (EUR per MWh discharged)")
         ax.set_ylim(bottom=0)
-    a.legend(title="duration")
+    b.legend(title="duration", loc="lower left")
     return _save(fig, out, "fig_g_cost_sensitivity")
 
 
