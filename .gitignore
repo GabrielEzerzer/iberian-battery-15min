@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+# Guard: the dataset lives outside the repo (IB15_DATA_DIR).
+data/
