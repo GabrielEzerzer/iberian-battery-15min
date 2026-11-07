@@ -1,0 +1,34 @@
+# CI for this repo, from D:/code/setup/ci.yml. Rules: D:/code/CLAUDE.md, "Test suites".
+# It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
+# and a branch has results before its PR exists.
+# Tests run offline (the HTTP layer is stubbed). Never give this workflow production URLs, real secrets,
+# .env.local or a service_role key.
+name: ci
+
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: uv sync --locked
+      - name: Tests
+        run: uv run pytest -q
+      - name: Lint
+        run: uv run ruff check
+      - name: Format
+        run: uv run ruff format --check
