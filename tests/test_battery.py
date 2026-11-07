@@ -1,5 +1,9 @@
+import errno
 import json
+import math
+import sys
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -12,11 +16,16 @@ from ib15.battery import (
     ETA,
     POWER_MW,
     RTE,
+    SENSITIVITY_COSTS,
     SOC_START,
     SPECS,
     SolveError,
     Spec,
+    _write_all,
+    cost_sensitivity,
+    daily_values,
     solve_day,
+    summarise,
 )
 from ib15.cli import main
 
@@ -178,7 +187,7 @@ def test_main_value_is_unchanged_by_the_shared_power_limit(hours, net15, neth):
     p = random_day(np.random.default_rng(hours))
     for prices, dt, expected in ((p, DT_15MIN, net15), (hourly(p), DT_HOURLY, neth)):
         r = solve_day(prices, dt, hours, MAIN)
-        assert r.net == pytest.approx(expected, abs=1e-6)
+        assert r.net == pytest.approx(expected, rel=1e-7)
         assert r.simultaneous == 0
 
 
@@ -188,15 +197,14 @@ def test_solver_failure_raises():
         solve_day(random_day(np.random.default_rng(0)), DT_15MIN, 1.0, impossible)
 
 
-def dataset_dir(tmp_path, ndays=3):
-    """A data dir with a tiny price dataset: ndays 96-period days and one 100-period day."""
-    rng = np.random.default_rng(1)
+def price_tables(days):
+    """15-minute and hourly price tables, as the dataset stores them, for a list of price days
+    starting on 2025-10-01."""
     rows = []
-    for i in range(ndays + 1):
+    for i, prices in enumerate(days):
         day = date(2025, 10, 1) + timedelta(days=i)
-        n = 100 if i == ndays else 96
         start = datetime(2025, 9, 30, 22, tzinfo=UTC) + timedelta(days=i)
-        for k, price in enumerate(random_day(rng, n)):
+        for k, price in enumerate(prices):
             rows.append((start + timedelta(minutes=15 * k), day, k + 1, price, price, 1))
     q = pd.DataFrame(
         rows,
@@ -211,6 +219,13 @@ def dataset_dir(tmp_path, ndays=3):
     )
     h = q.assign(period=(q["period"] - 1) // 4 + 1).groupby(["delivery_date", "period"])
     h = h.agg(price_es=("price_es", "mean")).reset_index()
+    return q, h
+
+
+def dataset_dir(tmp_path, ndays=3):
+    """A data dir with a tiny price dataset: ndays 96-period days and one 100-period day."""
+    rng = np.random.default_rng(1)
+    q, h = price_tables([random_day(rng, 100 if i == ndays else 96) for i in range(ndays + 1)])
     ds = tmp_path / "dataset"
     ds.mkdir()
     q.to_parquet(ds / "prices_15min.parquet", index=False)
@@ -222,13 +237,22 @@ def test_cli_writes_daily_summary_and_meta(tmp_path):
     data_dir = dataset_dir(tmp_path)
     assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
     out = data_dir / "results"
-    assert sorted(p.name for p in out.iterdir()) == [
-        "perfect_foresight_daily.parquet",
-        "perfect_foresight_meta.json",
-        "perfect_foresight_summary.csv",
-    ]
+    assert sorted(p.name for p in out.iterdir()) == RESULT_FILES
     daily = pd.read_parquet(out / "perfect_foresight_daily.parquet")
-    assert len(daily) == 4 * len(DURATIONS_H) * len(SPECS) * 2
+    # SPECS plus the sensitivity costs no spec already has (10, 30, 40 EUR/MWh).
+    assert len(daily) == 4 * len(DURATIONS_H) * (len(SPECS) + 3) * 2
+    # Each resolution is solved at its own period length: the 15-minute value is never below
+    # the hourly one, and a day matches a direct solve of its 15-minute prices.
+    wide = daily.pivot_table(
+        index=["delivery_date", "duration_h", "spec"], columns="resolution", values="net_eur_per_mw"
+    )
+    assert len(wide) == 4 * len(DURATIONS_H) * (len(SPECS) + 3)
+    assert (wide["15min"] >= wide["hourly"] - 1e-6).all()
+    q = pd.read_parquet(data_dir / "dataset" / "prices_15min.parquet")
+    first = q[q["delivery_date"] == date(2025, 10, 1)].sort_values("period")["price_es"]
+    assert wide.loc[(date(2025, 10, 1), 2, "main"), "15min"] == pytest.approx(
+        solve_day(first.to_numpy(), DT_15MIN, 2.0, MAIN).net, rel=1e-9
+    )
     main_rows = daily[daily["spec"] == "main"]
     assert np.allclose(
         main_rows["net_eur_per_mw"],
@@ -249,6 +273,216 @@ def test_cli_writes_daily_summary_and_meta(tmp_path):
     meta = json.loads((out / "perfect_foresight_meta.json").read_text())
     assert meta["date_range"] == {"start": "2025-10-01", "end": "2025-10-04"}
     assert meta["days"] == 4 and meta["round_trip_efficiency"] == 0.88
+    assert meta["cost_sensitivity_eur_per_mwh_discharged"] == [0.0, 10.0, 20.0, 30.0, 40.0]
+    # Every spec in the daily file, the sensitivity's cost_* ones included, is described in meta.
+    assert set(meta["specs"]) == set(daily["spec"])
+    assert meta["specs"]["cost_10"] == {
+        "cost_eur_per_mwh_discharged": 10.0,
+        "max_cycles_per_day": None,
+    }
+    sens = pd.read_csv(out / "perfect_foresight_cost_sensitivity.csv")
+    assert list(zip(sens["duration_h"], sens["cost_eur_per_mwh"], strict=True)) == [
+        (h, c) for h in DURATIONS_H for c in SENSITIVITY_COSTS
+    ]
+
+
+RESULT_FILES = [
+    "perfect_foresight_cost_sensitivity.csv",
+    "perfect_foresight_daily.parquet",
+    "perfect_foresight_meta.json",
+    "perfect_foresight_summary.csv",
+]
+
+
+def previous_results(out):
+    """Result files with contents of their own, as a previous run left them; returns the bytes."""
+    out.mkdir(exist_ok=True)
+    for name in RESULT_FILES:
+        (out / name).write_text(f"previous {name}")
+    return {name: (out / name).read_bytes() for name in RESULT_FILES}
+
+
+def files_in(folder):
+    return {p.name: p.read_bytes() for p in folder.iterdir()}
+
+
+def test_a_failed_write_leaves_the_previous_results_intact(tmp_path, monkeypatch):
+    data_dir = dataset_dir(tmp_path, ndays=1)
+    out = data_dir / "results"
+    previous = previous_results(out)
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    # The daily parquet is written first, then the CSVs fail.
+    monkeypatch.setattr(pd.DataFrame, "to_csv", fail)
+    with pytest.raises(OSError, match="disk full"):
+        main(["perfect-foresight", "--data-dir", str(data_dir)])
+    assert files_in(out) == previous  # the daily .part is removed too
+
+    # The next run leaves only the results.
+    monkeypatch.undo()
+    assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
+    assert sorted(p.name for p in out.iterdir()) == RESULT_FILES
+    assert len(pd.read_parquet(out / "perfect_foresight_daily.parquet")) > 0
+
+
+@pytest.mark.parametrize("locked", RESULT_FILES)
+def test_a_file_that_cannot_be_replaced_leaves_the_previous_results(
+    tmp_path, monkeypatch, capsys, locked
+):
+    # On Windows a file another program holds open (a CSV open in Excel) can be neither renamed
+    # nor replaced. Here every rename to or from the locked file fails the same way, on any OS.
+    data_dir = dataset_dir(tmp_path, ndays=1)
+    out = data_dir / "results"
+    previous = previous_results(out)
+    replace = Path.replace
+
+    def locked_replace(self, target):
+        if out / locked in (self, Path(target)):
+            raise PermissionError(errno.EACCES, "used by another process")
+        return replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", locked_replace)
+    assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1
+    assert f"cannot replace {out / locked}" in capsys.readouterr().err
+    assert files_in(out) == previous  # byte for byte, and no .part or .prev left
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="only Windows refuses to rename or replace a file another program has open",
+)
+def test_a_results_file_open_in_another_program_leaves_the_previous_results(tmp_path, capsys):
+    data_dir = dataset_dir(tmp_path, ndays=1)
+    out = data_dir / "results"
+    previous = previous_results(out)
+    summary = out / "perfect_foresight_summary.csv"
+    # Python's open() on Windows does not let others delete or rename the file, as Excel does.
+    with open(summary):
+        assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1
+    assert f"cannot replace {summary}" in capsys.readouterr().err
+    assert files_in(out) == previous
+    # Once the file is closed, the next run replaces the whole set.
+    assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
+    assert sorted(p.name for p in out.iterdir()) == RESULT_FILES
+    assert summary.read_bytes() != previous[summary.name]
+
+
+# What a run killed at each step leaves behind, for two files written in the order a, b, and
+# which set a later run that fails should leave in place: the files from before the killed run,
+# unless that run had put all its new files in place.
+KILLED = {
+    "while writing the parts": ({"a": "old a", "b": "old b", "a.part": "half"}, "old"),
+    "while moving the old files aside": (
+        {"a.prev": "old a", "b": "old b", "a.part": "new a", "b.part": "new b"},
+        "old",
+    ),
+    "while putting the new files in place": (
+        {"a": "new a", "a.prev": "old a", "b.prev": "old b", "b.part": "new b"},
+        "old",
+    ),
+    "while deleting the old files": ({"a": "new a", "b": "new b", "b.prev": "old b"}, "new"),
+}
+
+
+@pytest.mark.parametrize("leftovers, kept", KILLED.values(), ids=KILLED.keys())
+def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(tmp_path, leftovers, kept):
+    a, b = tmp_path / "a", tmp_path / "b"
+
+    def leave(files):
+        for p in tmp_path.iterdir():
+            p.unlink()
+        for name, text in files.items():
+            (tmp_path / name).write_text(text)
+
+    def write(text):
+        return lambda t: t.write_text(text)
+
+    def fail(t):
+        raise OSError("disk full")
+
+    leave(leftovers)
+    with pytest.raises(OSError, match="disk full"):
+        _write_all({a: write("newest a"), b: fail})
+    assert files_in(tmp_path) == {"a": f"{kept} a".encode(), "b": f"{kept} b".encode()}
+
+    leave(leftovers)
+    _write_all({a: write("newest a"), b: write("newest b")})
+    assert files_in(tmp_path) == {"a": b"newest a", "b": b"newest b"}
+
+
+def test_a_failed_rename_removes_a_new_file_with_no_previous_version(tmp_path, monkeypatch):
+    # b is new (no previous version) and goes in first; then putting a in place fails.
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.write_text("old a")
+    real_replace = Path.replace
+
+    def replace(self, target):
+        if self.name == "a.part" and Path(target) == a:
+            raise OSError("rename failed")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    with pytest.raises(OSError, match="rename failed"):
+        _write_all({b: lambda t: t.write_text("new b"), a: lambda t: t.write_text("new a")})
+    assert files_in(tmp_path) == {"a": b"old a"}
+
+
+@pytest.fixture(scope="module")
+def sensitivity_daily():
+    rng = np.random.default_rng(11)
+    days = [random_day(rng) for _ in range(3)] + [random_day(rng, 92)]
+    days.append(np.tile(np.repeat([10.0, 150.0], 8), 6))  # pays for many cycles a day
+    return daily_values(*price_tables(days))
+
+
+def test_sensitivity_at_20_and_0_reproduces_main_and_no_cost(sensitivity_daily):
+    summary = summarise(sensitivity_daily)
+    sens = cost_sensitivity(sensitivity_daily)
+    shared = [c for c in summary.columns if c not in ("duration_h", "spec")]
+    assert set(shared) < set(sens.columns)
+    for cost, spec in ((20.0, "main"), (0.0, "no_cost")):
+        for hours in DURATIONS_H:
+            a = summary[(summary["duration_h"] == hours) & (summary["spec"] == spec)][shared]
+            b = sens[(sens["duration_h"] == hours) & (sens["cost_eur_per_mwh"] == cost)][shared]
+            assert len(a) == len(b) == 1
+            assert a.iloc[0].equals(b.iloc[0])
+
+
+@pytest.mark.parametrize("resolution", ["15min", "hourly"])
+def test_net_value_and_cycles_fall_as_the_wear_cost_rises(sensitivity_daily, resolution):
+    sens = cost_sensitivity(sensitivity_daily)
+    net, cycles = f"net_{resolution}_keur_per_mw", f"cycles_per_day_{resolution}"
+    for hours in DURATIONS_H:
+        g = sens[sens["duration_h"] == hours].sort_values("cost_eur_per_mwh")
+        assert list(g["cost_eur_per_mwh"]) == list(SENSITIVITY_COSTS)
+        for column in (net, cycles):
+            assert (np.diff(g[column].to_numpy()) <= 1e-9).all(), (hours, column)
+        # Strictly lower from the first cost to the last, so the costs are applied at all.
+        assert g[net].iloc[-1] < g[net].iloc[0] and g[cycles].iloc[-1] < g[cycles].iloc[0]
+
+
+def test_15min_net_is_at_least_hourly_at_every_cost(sensitivity_daily):
+    sens = cost_sensitivity(sensitivity_daily)
+    assert (sens["net_15min_keur_per_mw"] >= sens["net_hourly_keur_per_mw"] - 1e-9).all()
+    assert (sens["net_uplift_keur_per_mw"] > 0).all()
+
+
+def test_percent_uplift_is_nan_when_the_hourly_total_is_zero():
+    # Each hour alternates 0 and 100 by quarter-hour: the hourly price is a flat 50, so the
+    # hourly value is zero, while the 15-minute prices pay for cycling.
+    daily = daily_values(*price_tables([np.tile([0.0, 100.0], 48)]))
+    summary = summarise(daily)
+    assert (summary["net_hourly_keur_per_mw"] == 0).all()
+    assert (summary["net_15min_keur_per_mw"] > 0).all()
+    assert summary["net_uplift_pct"].map(math.isnan).all()
+    assert summary["gross_uplift_pct"].map(math.isnan).all()
+    # Solver noise around zero counts as zero rather than giving a huge percentage.
+    daily.loc[daily["resolution"] == "hourly", ["net_eur_per_mw", "gross_eur_per_mw"]] += 1e-9
+    noisy = summarise(daily)
+    assert noisy["net_uplift_pct"].map(math.isnan).all()
+    assert noisy["gross_uplift_pct"].map(math.isnan).all()
 
 
 def test_hourly_prices_that_are_not_the_mean_are_rejected(tmp_path, capsys):
