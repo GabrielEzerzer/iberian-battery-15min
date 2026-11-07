@@ -1,12 +1,12 @@
-"""Command line: ``ib15 download omie`` and ``ib15 build``."""
+"""Command line: ``ib15 download omie|weather`` and ``ib15 build [prices|weather]``."""
 
 import argparse
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from ib15 import dataset, omie
+from ib15 import dataset, omie, weather
 
 ENV_DATA_DIR = "IB15_DATA_DIR"
 
@@ -42,8 +42,41 @@ def _download(args) -> int:
     return 1 if r.errors else 0
 
 
+def _latest_price_day(data_dir: Path):
+    """The latest delivery day among the raw OMIE files, or None if there are none."""
+    raw = data_dir / "raw" / "omie"
+    days = [m.group(1) for p in raw.glob("marginalpdbc_*") if (m := omie.FILE_RE.match(p.name))]
+    return datetime.strptime(max(days), "%Y%m%d").date() if days else None
+
+
+def _download_weather(args) -> int:
+    data_dir = _data_dir(args.data_dir)
+    # The first price day starts at 22:00 UTC the day before (local midnight in Madrid).
+    start = args.start or omie.GO_LIVE - timedelta(days=1)
+    end = args.end or _latest_price_day(data_dir) or omie.madrid_today() + timedelta(days=1)
+    if end < start:
+        raise SystemExit(f"error: --end {end} is before --start {start}")
+    print(f"weather {start} .. {end} (UTC dates), {weather.MODEL} {weather.LEAD}")
+    r = weather.download(data_dir / "raw" / "openmeteo", start, end)
+    print(f"saved {len(r.saved)}, already saved {len(r.skipped)}, errors {len(r.errors)}")
+    for name, msg in r.errors:
+        print(f"  ERROR {name}: {msg}", file=sys.stderr)
+    return 1 if r.errors else 0
+
+
 def _build(args) -> int:
     data_dir = _data_dir(args.data_dir)
+    if args.what == "weather":
+        try:
+            cov = weather.build(data_dir)
+        except dataset.BuildError as e:
+            print(f"weather build failed:\n{e}", file=sys.stderr)
+            return 1
+        print(
+            f"built weather {cov['model']} {cov['lead']}: {cov['rows_weather_hourly']} hourly rows,"
+            f" {cov['rows_prices_weather_15min']} quarter-hours -> {data_dir / 'dataset'}"
+        )
+        return 0
     try:
         cov = dataset.build(data_dir)
     except dataset.BuildError as e:
@@ -72,7 +105,29 @@ def main(argv: list[str] | None = None) -> int:
         help="last day (default: tomorrow in Madrid, the latest that can be published)",
     )
     om.set_defaults(func=_download)
+    we = dl_sub.add_parser(
+        "weather", parents=[common], help="Open-Meteo archived forecasts (ECMWF IFS, 48 h lead)"
+    )
+    we.add_argument(
+        "--start",
+        type=date.fromisoformat,
+        help=f"first UTC date (default {omie.GO_LIVE - timedelta(days=1)}, where the first"
+        " price day starts in UTC)",
+    )
+    we.add_argument(
+        "--end",
+        type=date.fromisoformat,
+        help="last UTC date (default: the latest day in raw/omie, else tomorrow in Madrid)",
+    )
+    we.set_defaults(func=_download_weather)
     b = sub.add_parser("build", parents=[common], help="validate raw files and write the dataset")
+    b.add_argument(
+        "what",
+        nargs="?",
+        choices=["prices", "weather"],
+        default="prices",
+        help="prices (default), or weather: join the forecasts to prices_15min.parquet",
+    )
     b.set_defaults(func=_build)
 
     args = parser.parse_args(argv)

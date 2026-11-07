@@ -1,2 +1,2 @@
-# OMIE fixtures are byte-exact copies of the raw files (CRLF, latin-1).
+# Fixtures are byte-exact copies of raw files and responses (OMIE: CRLF, latin-1).
 tests/fixtures/** -text
