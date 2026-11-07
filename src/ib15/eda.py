@@ -2,8 +2,9 @@
 and where the perfect-foresight 15-minute uplift comes from.
 
 The computed quantities are small pure functions (within-hour spread, quarter deviations,
-concentration shares, autocorrelation at a lag, national mean weather, season); ``run`` reads
-the inputs, builds the tables and figures and writes them to ``data_dir/results/eda``.
+concentration shares, autocorrelation at a lag, national mean weather); ``run`` checks the
+inputs, builds the tables and figures and writes them to ``data_dir/results/eda`` all together
+or not at all.
 Every correlation here is a plain Pearson coefficient and is descriptive only: it says how the
 series move together over the sample, not what a forecast will achieve.
 """
@@ -20,7 +21,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from ib15.battery import DURATIONS_H, _write  # noqa: E402
+from ib15.battery import DURATIONS_H, _write_all  # noqa: E402
 from ib15.dataset import BuildError, _git  # noqa: E402
 from ib15.omie import MADRID  # noqa: E402
 from ib15.weather import LOCATIONS, VARIABLES  # noqa: E402
@@ -29,6 +30,14 @@ from ib15.weather import LOCATIONS, VARIABLES  # noqa: E402
 FLAT_TOL = 0.005  # EUR/MWh
 # Both resolutions are solved to HiGHS tolerances; a daily difference below this is zero.
 ZERO_UPLIFT_TOL = 0.01  # EUR/MW
+# The columns of perfect_foresight_cost_sensitivity.csv (battery.cost_sensitivity) that figure G
+# plots.
+SENSITIVITY_COLUMNS = (
+    "duration_h",
+    "cost_eur_per_mwh",
+    "net_uplift_pct",
+    "net_uplift_eur_per_mw_day",
+)
 SEASONS = {
     12: "winter",
     1: "winter",
@@ -61,11 +70,6 @@ WIDTH = 6.5  # inches, a single text column
 
 
 # ---------------------------------------------------------------- pure functions
-
-
-def season(month: int) -> str:
-    """Meteorological season of a calendar month (December-February is winter)."""
-    return SEASONS[month]
 
 
 def hour_table(q: pd.DataFrame) -> pd.DataFrame:
@@ -294,7 +298,10 @@ def forecast_motivation(
     of a quarter from its hourly mean is uncorrelated with the hourly weather by construction
     (the deviations sum to zero within each hour, where the weather is constant), so the
     within-hour shape is described by the hour's spread (against the weather level) and its
-    slope Q4 - Q1 (against the change in weather to the next hour) instead."""
+    slope Q4 - Q1 (against the change in weather across the hour) instead. Temperature and wind
+    are values at the start of each hour, so their change across the hour is the next hour's
+    value minus this hour's. Radiation is the mean over each hour, so its change centred on the
+    same hour is half the difference between the next hour's mean and the previous hour's."""
     rows = []
 
     def add(quantity, against, r, n, description):
@@ -324,7 +331,11 @@ def forecast_motivation(
 
     qwx = wx.reindex(price.index.floor("h"))
     hwx = wx.reindex(hours["start_utc"])
-    change = (wx.shift(-1, freq="h").reindex(wx.index) - wx).reindex(hours["start_utc"])
+    rad = "shortwave_radiation"
+    nxt, prv = (wx.shift(n, freq="h").reindex(wx.index) for n in (-1, 1))
+    change = nxt - wx
+    change[rad] = (nxt[rad] - prv[rad]) / 2
+    change = change.reindex(hours["start_utc"])
     for var in VARIABLES:
         add(
             "daily_mean_price",
@@ -344,11 +355,20 @@ def forecast_motivation(
             *corr(hours["spread"], hwx[var].reset_index(drop=True)),
             "per hour; spread = max - min of the four quarters",
         )
+        if var == rad:
+            against = f"change in national mean {var} per hour, centred on the UTC hour"
+            how = (
+                "per hour; slope = Q4 - Q1; radiation is the mean over its hour, so its change is"
+                " (next hour - previous hour) / 2, centred on the middle of the hour like the slope"
+            )
+        else:
+            against = f"change in national mean {var} to the next UTC hour"
+            how = "per hour; slope = Q4 - Q1"
         add(
             "within_hour_slope",
-            f"change in national mean {var} to the next UTC hour",
+            against,
             *corr(hours["slope"], change[var].reset_index(drop=True)),
-            "per hour; slope = Q4 - Q1",
+            how,
         )
     return pd.DataFrame(rows)
 
@@ -382,18 +402,7 @@ def _style() -> None:
     )
 
 
-def _save(fig, out: Path, name: str) -> list[str]:
-    if fig.get_layout_engine() is None:
-        fig.tight_layout()
-    written = []
-    for ext in ("png", "pdf"):
-        _write(out / f"{name}.{ext}", lambda t, e=ext: fig.savefig(t, format=e, dpi=DPI))
-        written.append(f"{name}.{ext}")
-    plt.close(fig)
-    return written
-
-
-def fig_daily(daily: pd.DataFrame, out: Path) -> list[str]:
+def fig_daily(daily: pd.DataFrame) -> plt.Figure:
     x = pd.to_datetime(daily["delivery_date"].astype(str))
     fig, (a, b) = plt.subplots(2, 1, figsize=(WIDTH, 4), sharex=True)
     a.plot(x, daily["mean_price"], color=SERIES[0])
@@ -404,14 +413,15 @@ def fig_daily(daily: pd.DataFrame, out: Path) -> list[str]:
     b.set_title("Daily mean within-hour spread (max − min of the four quarter-hours)")
     b.set_ylim(bottom=0)
     fig.autofmt_xdate()
-    return _save(fig, out, "fig_a_daily_price_and_spread")
+    return fig
 
 
-def fig_profile(q: pd.DataFrame, out: Path) -> list[str]:
+def fig_profile(q: pd.DataFrame) -> plt.Figure:
     lt = q["delivery_start_utc"].dt.tz_convert(MADRID)
+    dates = pd.to_datetime(q["delivery_date"].astype(str))
     df = pd.DataFrame(
         {
-            "season": pd.to_datetime(q["delivery_date"].astype(str)).dt.month.map(SEASONS),
+            "season": dates.dt.month.map(SEASONS),
             "slot": lt.dt.hour * 4 + lt.dt.minute // 15,
             "price": q["price_es"],
         }
@@ -438,12 +448,16 @@ def fig_profile(q: pd.DataFrame, out: Path) -> list[str]:
     ax.set_xticks(range(0, 25, 3))
     ax.set_xlabel("hour of day, local time (Madrid)")
     ax.set_ylabel("mean price (EUR/MWh)")
-    ax.set_title("Average price by quarter-hour of day and season")
+    # Each season averages every year the sample covers it in, such as autumn 2025 and 2026.
+    ax.set_title(
+        "Average price by quarter-hour of day and season, all years pooled"
+        f" ({dates.min():%b %Y} – {dates.max():%b %Y})"
+    )
     ax.legend(ncol=2, fontsize=7)
-    return _save(fig, out, "fig_b_profile_by_season")
+    return fig
 
 
-def fig_quarter_deviation(q: pd.DataFrame, out: Path) -> list[str]:
+def fig_quarter_deviation(q: pd.DataFrame) -> plt.Figure:
     lt = q["delivery_start_utc"].dt.tz_convert(MADRID)
     df = pd.DataFrame(
         {
@@ -463,10 +477,10 @@ def fig_quarter_deviation(q: pd.DataFrame, out: Path) -> list[str]:
     ax.set_ylabel("quarter price − hourly mean (EUR/MWh)")
     ax.set_title("Mean deviation of each quarter-hour from its hourly mean")
     ax.legend(ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.2))
-    return _save(fig, out, "fig_c_quarter_deviation_by_hour")
+    return fig
 
 
-def fig_spread_hist(hours: pd.DataFrame, out: Path) -> list[str]:
+def fig_spread_hist(hours: pd.DataFrame) -> plt.Figure:
     s = hours["spread"]
     cut = s.quantile(0.99)
     beyond = (s > cut).mean()
@@ -487,10 +501,10 @@ def fig_spread_hist(hours: pd.DataFrame, out: Path) -> list[str]:
         color=INK_2,
         fontsize=7,
     )
-    return _save(fig, out, "fig_d_spread_distribution")
+    return fig
 
 
-def fig_uplift_month(by_month: pd.DataFrame, out: Path) -> list[str]:
+def fig_uplift_month(by_month: pd.DataFrame) -> plt.Figure:
     months = sorted(by_month["month"].unique())
     fig, ax = plt.subplots(figsize=(WIDTH, 3.2))
     for i, d in enumerate(DURATIONS_H):
@@ -511,10 +525,10 @@ def fig_uplift_month(by_month: pd.DataFrame, out: Path) -> list[str]:
     ax.set_ylabel("uplift (EUR/MW per day)")
     ax.set_title("Perfect-foresight 15-minute uplift over hourly, by month (main spec)")
     ax.legend(title="duration")
-    return _save(fig, out, "fig_e_uplift_by_month")
+    return fig
 
 
-def fig_uplift_scatter(up: pd.DataFrame, daily: pd.DataFrame, out: Path) -> list[str]:
+def fig_uplift_scatter(up: pd.DataFrame, daily: pd.DataFrame) -> plt.Figure:
     d = daily.set_index("delivery_date")["mean_spread"]
     fig, axes = plt.subplots(1, len(DURATIONS_H), figsize=(WIDTH, 2.8), sharex=True, sharey=True)
     for i, (ax, dur) in enumerate(zip(axes, DURATIONS_H, strict=True)):
@@ -531,36 +545,16 @@ def fig_uplift_scatter(up: pd.DataFrame, daily: pd.DataFrame, out: Path) -> list
     axes[0].set_ylabel("daily uplift (EUR/MW)")
     fig.supxlabel("day's mean within-hour spread (EUR/MWh)", fontsize=8)
     fig.suptitle("Daily 15-minute uplift against the day's mean within-hour spread (main spec)")
-    return _save(fig, out, "fig_f_uplift_vs_spread")
+    return fig
 
 
-def _sensitivity_columns(s: pd.DataFrame) -> tuple[str, str, str]:
-    """The wear-cost, uplift-percent and uplift-per-day columns of the sensitivity CSV, found by
-    name so the figure does not depend on the exact naming chosen when the file was written."""
-
-    def one(pred, what):
-        cols = [c for c in s.columns if pred(c)]
-        net = [c for c in cols if c.startswith("net")]
-        cols = net or cols
-        if len(cols) != 1:
-            raise BuildError(f"cost sensitivity CSV: cannot find one {what} column in {list(s)}")
-        return cols[0]
-
-    return (
-        one(lambda c: "cost" in c, "wear-cost"),
-        one(lambda c: c.endswith("pct"), "uplift percent"),
-        one(lambda c: c.endswith("per_mw_day"), "uplift EUR/MW per day"),
-    )
-
-
-def fig_sensitivity(s: pd.DataFrame, out: Path) -> list[str]:
-    cost, pct, per_day = _sensitivity_columns(s)
+def fig_sensitivity(s: pd.DataFrame) -> plt.Figure:
     fig, (a, b) = plt.subplots(1, 2, figsize=(WIDTH, 2.8), sharex=True)
     for i, d in enumerate(DURATIONS_H):
-        g = s[s["duration_h"] == d].sort_values(cost)
+        g = s[s["duration_h"] == d].sort_values("cost_eur_per_mwh")
         kw = {"color": SERIES[i], "marker": "o", "markersize": 3, "label": f"{d} h"}
-        a.plot(g[cost], g[pct], **kw)
-        b.plot(g[cost], g[per_day], **kw)
+        a.plot(g["cost_eur_per_mwh"], g["net_uplift_pct"], **kw)
+        b.plot(g["cost_eur_per_mwh"], g["net_uplift_eur_per_mw_day"], **kw)
     a.set_ylabel("uplift (%)")
     a.set_title("15-minute uplift, percent of hourly")
     b.set_ylabel("uplift (EUR/MW per day)")
@@ -569,10 +563,10 @@ def fig_sensitivity(s: pd.DataFrame, out: Path) -> list[str]:
         ax.set_xlabel("wear cost (EUR per MWh discharged)")
         ax.set_ylim(bottom=0)
     b.legend(title="duration", loc="lower left")
-    return _save(fig, out, "fig_g_cost_sensitivity")
+    return fig
 
 
-def fig_price_weather(q: pd.DataFrame, wx: pd.DataFrame, out: Path) -> list[str]:
+def fig_price_weather(q: pd.DataFrame, wx: pd.DataFrame) -> plt.Figure:
     w = wx.reindex(q["delivery_start_utc"].dt.floor("h"))
     fig, axes = plt.subplots(1, 2, figsize=(WIDTH, 2.9), sharey=True, layout="constrained")
     bins = []
@@ -596,7 +590,7 @@ def fig_price_weather(q: pd.DataFrame, wx: pd.DataFrame, out: Path) -> list[str]
     fig.colorbar(bins[0], ax=axes, label="quarter-hours (log scale)")
     axes[0].set_ylabel("15-minute price (EUR/MWh)")
     fig.suptitle("Price against the forecast weather of its hour (descriptive)")
-    return _save(fig, out, "fig_h_price_vs_weather")
+    return fig
 
 
 # ---------------------------------------------------------------- run
@@ -611,8 +605,10 @@ def _input(path: Path, time_col: str) -> tuple[pd.DataFrame, dict]:
 
 def run(data_dir: Path) -> dict:
     """Read the dataset and the perfect-foresight results, write every table and figure to
-    ``data_dir/results/eda`` and return the meta record. Raises BuildError if a required input
-    is missing."""
+    ``data_dir/results/eda`` and return the meta record. Every input is checked and every output
+    built before anything is written, and the outputs replace the previous set all together or
+    not at all (``battery._write_all``). Raises BuildError if an input is missing or lacks a
+    column or an hour the outputs need."""
     started = time.perf_counter()
     ds, res = data_dir / "dataset", data_dir / "results"
     required = {
@@ -635,6 +631,12 @@ def run(data_dir: Path) -> dict:
     sens_path = res / "perfect_foresight_cost_sensitivity.csv"
     sens = pd.read_csv(sens_path) if sens_path.exists() else None
     if sens is not None:
+        absent = [c for c in SENSITIVITY_COLUMNS if c not in sens.columns]
+        if absent:
+            raise BuildError(
+                f"{sens_path} has no column {', '.join(absent)}; run `ib15 perfect-foresight`"
+                " again to rewrite it"
+            )
         inputs["perfect_foresight_cost_sensitivity"] = {"path": str(sens_path), "rows": len(sens)}
 
     hours = hour_table(q)
@@ -653,38 +655,57 @@ def run(data_dir: Path) -> dict:
         "weather_summary.csv": weather_summary(weather),
         "forecast_motivation.csv": forecast_motivation(q, hours, daily, wx),
     }
-    out = res / "eda"
-    out.mkdir(parents=True, exist_ok=True)
-    outputs = []
-    for name, df in tables.items():
-        _write(out / name, lambda t, df=df: df.round(4).to_csv(t, index=False))
-        outputs.append(name)
-
     _style()
-    outputs += fig_daily(daily, out)
-    outputs += fig_profile(q, out)
-    outputs += fig_quarter_deviation(q, out)
-    outputs += fig_spread_hist(hours, out)
-    outputs += fig_uplift_month(tables["uplift_by_month.csv"], out)
-    outputs += fig_uplift_scatter(up, daily, out)
+    figures = {
+        "fig_a_daily_price_and_spread": fig_daily(daily),
+        "fig_b_profile_by_season": fig_profile(q),
+        "fig_c_quarter_deviation_by_hour": fig_quarter_deviation(q),
+        "fig_d_spread_distribution": fig_spread_hist(hours),
+        "fig_e_uplift_by_month": fig_uplift_month(tables["uplift_by_month.csv"]),
+        "fig_f_uplift_vs_spread": fig_uplift_scatter(up, daily),
+    }
     skipped = []
     if sens is not None:
-        outputs += fig_sensitivity(sens, out)
+        figures["fig_g_cost_sensitivity"] = fig_sensitivity(sens)
     else:
         skipped.append(f"fig_g_cost_sensitivity: {sens_path} does not exist")
-    outputs += fig_price_weather(q, wx, out)
+    figures["fig_h_price_vs_weather"] = fig_price_weather(q, wx)
 
+    out = res / "eda"
+    files = {
+        out / name: (lambda t, df=df: df.round(4).to_csv(t, index=False))
+        for name, df in tables.items()
+    }
+    for name, fig in figures.items():
+        if fig.get_layout_engine() is None:
+            fig.tight_layout()
+        for ext in ("png", "pdf"):
+            # The writer gets a .part path, so the format is given rather than read from it.
+            files[out / f"{name}.{ext}"] = lambda t, f=fig, e=ext: f.savefig(t, format=e, dpi=DPI)
     status = _git("status", "--porcelain")
     meta = {
         "inputs": inputs,
-        "outputs": outputs + ["eda_meta.json"],
+        "outputs": [p.name for p in files] + ["eda_meta.json"],
         "skipped": skipped,
-        "seconds": round(time.perf_counter() - started, 1),
+        "seconds": None,
         "git_commit": _git("rev-parse", "HEAD"),
         "git_dirty": None if status is None else bool(status),
     }
-    _write(
-        out / "eda_meta.json",
-        lambda t: t.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8"),
-    )
+
+    def write_meta(t: Path) -> None:
+        # The meta is written last, so its time includes drawing every figure.
+        meta["seconds"] = round(time.perf_counter() - started, 1)
+        t.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+    files[out / "eda_meta.json"] = write_meta
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_all(files)
+    finally:
+        for fig in figures.values():
+            plt.close(fig)
+    if sens is None:
+        # A figure G from an earlier run, or a part of one, does not match the new outputs.
+        for p in out.glob("fig_g_*"):
+            p.unlink()
     return meta

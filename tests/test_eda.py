@@ -1,8 +1,11 @@
+import json
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib.figure import Figure
 
 from ib15 import cli, eda
 from ib15.dataset import hourly_benchmark
@@ -128,13 +131,57 @@ def test_national_mean_rejects_a_missing_location_hour():
         eda.national_mean(w)
 
 
-@pytest.mark.parametrize(
-    "month,expected",
-    [(11, "autumn"), (12, "winter"), (2, "winter"), (3, "spring"), (5, "spring"), (6, "summer")]
-    + [(8, "summer"), (9, "autumn"), (1, "winter")],
-)
-def test_season_boundaries(month, expected):
-    assert eda.season(month) == expected
+def test_uplift_by_month_percent_is_a_ratio_of_sums():
+    # Two days of one month with unequal hourly value. Their daily uplifts of 10% and 5% average
+    # to 7.5%, but over the month the 15-minute value is (110 + 315) / (100 + 300) of hourly.
+    days = [date(2025, 10, 21), date(2025, 10, 22)]
+    q = prices(days, price_fn=lambda i: [40.0, 60.0, 50.0, 50.0][i % 4])  # spread 20, mean 50
+    up = pd.DataFrame(
+        {
+            "delivery_date": days,
+            "duration_h": [2, 2],
+            "net_15min": [110.0, 315.0],
+            "net_hourly": [100.0, 300.0],
+        }
+    )
+    up["uplift"] = up["net_15min"] - up["net_hourly"]
+    m = eda.uplift_by_month(up, q, eda.hour_table(q))
+    assert len(m) == 1
+    row = m.iloc[0]
+    assert (row["month"], row["duration_h"], row["days"]) == ("2025-10", 2, 2)
+    assert row["uplift_eur_per_mw"] == pytest.approx(25.0)
+    assert row["uplift_eur_per_mw_day"] == pytest.approx(12.5)
+    assert row["uplift_pct"] == pytest.approx(6.25)
+    assert row["mean_within_hour_spread"] == pytest.approx(20.0)
+    assert row["mean_price"] == pytest.approx(50.0)
+
+
+def test_within_hour_slope_is_compared_with_the_weather_change_across_the_hour():
+    # Each hour's slope Q4 - Q1 is a random step, and the weather is built so that its change
+    # across each hour is that step: the next hour's value minus this hour's for temperature and
+    # wind (values at the hour's start), and (next hour - previous hour) / 2 for radiation (a
+    # mean over the hour). Every slope row then has r = +1; a change taken towards the previous
+    # hour, or radiation's taken to the next hour only, would not.
+    days = [date(2025, 10, 21), date(2025, 10, 22)]
+    steps = np.random.default_rng(3).normal(size=48)
+    q = prices(days, price_fn=lambda i: 50.0 + (steps[i // 4] if i % 4 == 3 else 0.0))
+    hours = eda.hour_table(q)
+    assert hours["slope"].to_numpy() == pytest.approx(steps)
+    # The weather runs from the hour before the first price hour to the hour after the last.
+    times = pd.date_range(hours["start_utc"].iloc[0] - pd.Timedelta(hours=1), periods=50, freq="h")
+    walk = np.concatenate([[0.0, 0.0], np.cumsum(steps)])  # walk[i + 2] - walk[i + 1] = steps[i]
+    centred = np.zeros(50)
+    for i, step in enumerate(steps):  # (centred[i + 2] - centred[i]) / 2 = steps[i]
+        centred[i + 2] = centred[i] + 2 * step
+    wx = pd.DataFrame(
+        {"temperature_2m": walk, "wind_speed_100m": walk, "shortwave_radiation": centred},
+        index=times,
+    )
+    fm = eda.forecast_motivation(q, hours, eda.daily_table(q, hours, wx), wx)
+    slope = fm[fm["quantity"] == "within_hour_slope"]
+    assert len(slope) == len(VARIABLES)
+    assert slope["pearson_r"].tolist() == pytest.approx([1.0] * len(VARIABLES))
+    assert (slope["n"] == 48).all()
 
 
 def write_data_dir(root, with_sensitivity):
@@ -198,14 +245,21 @@ FIGURES = [
 ]
 
 
+def output_names(with_sensitivity):
+    figures = FIGURES + (["fig_g_cost_sensitivity"] if with_sensitivity else [])
+    return set(TABLES) | {f"{f}.{e}" for f in figures for e in ("png", "pdf")} | {"eda_meta.json"}
+
+
+def files_in(folder):
+    return {p.name: p.read_bytes() for p in folder.iterdir()}
+
+
 @pytest.mark.parametrize("with_sensitivity", [False, True])
 def test_eda_command_writes_every_output(tmp_path, capsys, with_sensitivity):
     write_data_dir(tmp_path, with_sensitivity)
     assert cli.main(["eda", "--data-dir", str(tmp_path)]) == 0
     out = tmp_path / "results" / "eda"
-    figures = FIGURES + (["fig_g_cost_sensitivity"] if with_sensitivity else [])
-    expected = set(TABLES) | {f"{f}.{e}" for f in figures for e in ("png", "pdf")}
-    expected.add("eda_meta.json")
+    expected = output_names(with_sensitivity)
     assert {p.name for p in out.iterdir()} == expected
     assert all((out / name).stat().st_size > 0 for name in expected)
     printed = capsys.readouterr().out
@@ -225,3 +279,54 @@ def test_eda_command_fails_clearly_on_missing_input(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "weather_hourly.parquet" in err
     assert not (tmp_path / "results" / "eda").exists()
+
+
+def test_a_cost_sensitivity_file_without_a_plotted_column_stops_the_run(tmp_path, capsys):
+    write_data_dir(tmp_path, True)
+    path = tmp_path / "results" / "perfect_foresight_cost_sensitivity.csv"
+    pd.read_csv(path).drop(columns="net_uplift_pct").to_csv(path, index=False)
+    assert cli.main(["eda", "--data-dir", str(tmp_path)]) == 1
+    assert "has no column net_uplift_pct" in capsys.readouterr().err
+    assert not (tmp_path / "results" / "eda").exists()
+
+
+def test_a_failure_partway_leaves_the_previous_outputs(tmp_path, monkeypatch):
+    write_data_dir(tmp_path, True)
+    out = tmp_path / "results" / "eda"
+    out.mkdir()
+    for name in output_names(True):
+        (out / name).write_text(f"previous {name}")
+    previous = files_in(out)
+    savefig = Figure.savefig
+
+    def fail_at_figure_e(self, fname, *args, **kwargs):
+        # By now the tables and figures A to D have been written to their .part files.
+        if Path(fname).name.startswith("fig_e_"):
+            raise OSError("disk full")
+        return savefig(self, fname, *args, **kwargs)
+
+    monkeypatch.setattr(Figure, "savefig", fail_at_figure_e)
+    with pytest.raises(OSError, match="disk full"):
+        cli.main(["eda", "--data-dir", str(tmp_path)])
+    assert files_in(out) == previous  # byte for byte, and no .part or .prev left
+
+    # The next run replaces every file.
+    monkeypatch.undo()
+    assert cli.main(["eda", "--data-dir", str(tmp_path)]) == 0
+    new = files_in(out)
+    assert set(new) == set(previous)
+    assert all(new[name] != previous[name] for name in previous)
+
+
+def test_a_run_without_the_cost_sensitivity_deletes_an_earlier_figure_g(tmp_path):
+    write_data_dir(tmp_path, True)
+    assert cli.main(["eda", "--data-dir", str(tmp_path)]) == 0
+    out = tmp_path / "results" / "eda"
+    assert (out / "fig_g_cost_sensitivity.png").exists()
+    (out / "fig_g_cost_sensitivity.pdf.part").write_text("left by a killed run")
+    (tmp_path / "results" / "perfect_foresight_cost_sensitivity.csv").unlink()
+    assert cli.main(["eda", "--data-dir", str(tmp_path)]) == 0
+    assert {p.name for p in out.iterdir()} == output_names(False)
+    meta = json.loads((out / "eda_meta.json").read_text(encoding="utf-8"))
+    assert meta["skipped"][0].startswith("fig_g_cost_sensitivity:")
+    assert set(meta["outputs"]) == output_names(False)
