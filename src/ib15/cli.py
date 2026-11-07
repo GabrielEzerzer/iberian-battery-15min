@@ -1,4 +1,5 @@
-"""Command line: ``ib15 download omie|weather`` and ``ib15 build [prices|weather]``."""
+"""Command line: ``ib15 download omie|weather``, ``ib15 build [prices|weather]`` and
+``ib15 perfect-foresight``."""
 
 import argparse
 import os
@@ -6,7 +7,7 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from ib15 import dataset, omie, weather
+from ib15 import battery, dataset, omie, weather
 
 ENV_DATA_DIR = "IB15_DATA_DIR"
 
@@ -89,6 +90,22 @@ def _build(args) -> int:
     return 0
 
 
+def _perfect_foresight(args) -> int:
+    data_dir = _data_dir(args.data_dir)
+    try:
+        meta = battery.perfect_foresight(data_dir)
+    except (dataset.BuildError, battery.SolveError) as e:
+        print(f"perfect-foresight failed:\n{e}", file=sys.stderr)
+        return 1
+    print(
+        f"solved {meta['date_range']['start']} .. {meta['date_range']['end']}: {meta['days']} days"
+        f" in {meta['solve_seconds']} s -> {data_dir / 'results'}"
+    )
+    for key, n in meta["simultaneous_periods"].items():
+        print(f"  simultaneous charge and discharge periods, {key}: {n}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", help=f"data directory (default: ${ENV_DATA_DIR})")
@@ -129,6 +146,12 @@ def main(argv: list[str] | None = None) -> int:
         help="prices (default), or weather: join the forecasts to prices_15min.parquet",
     )
     b.set_defaults(func=_build)
+    pf = sub.add_parser(
+        "perfect-foresight",
+        parents=[common],
+        help="perfect-foresight battery value at 15-minute and hourly prices",
+    )
+    pf.set_defaults(func=_perfect_foresight)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -44,6 +44,24 @@ Bids for delivery day D close at 12:00 Madrid time on D-1. Every forecast value 
 - `prices_weather_15min.parquet`: the rows of `prices_15min.parquet`, each with the weather of the UTC hour containing its start, one column per variable and location (`temp_madrid`, `wind100_zaragoza`, `ghi_badajoz`, ...).
 - `weather_coverage.json`: model, lead, locations, hours expected and present per location, nulls, units, the smallest margin before the bid deadline and the git commit.
 
+## Perfect-foresight battery value
+
+```
+uv run ib15 perfect-foresight    # after `ib15 build`
+```
+
+This computes the most a battery could have earned on each delivery day if it had known the day's Spanish day-ahead prices (`price_es`) in advance. It does this once with the 15-minute prices and once with the hourly benchmark, where charging and discharging power stay constant for each whole hour.
+
+The battery has 1 MW of power and 1, 2 or 4 hours of storage (1, 2 or 4 MWh). Its round-trip efficiency is 88%, split equally between charging and discharging. Every delivery day, including the DST change days, starts and ends half full and is optimised on its own as a linear programme solved with HiGHS. There are three specifications. `main` charges 20 EUR for every MWh discharged as a degradation cost. `no_cost` has no degradation cost. `cap2` has no degradation cost and allows at most two full cycles a day.
+
+The command writes to `$IB15_DATA_DIR/results/`:
+
+- `perfect_foresight_daily.parquet`: one row per delivery day, duration, specification and resolution, with gross revenue, degradation cost and net value in EUR per MW, MWh discharged, full cycles, and the number of periods in which the solution both charges and discharges.
+- `perfect_foresight_summary.csv`: for each duration and specification, the net and gross value over the whole sample at both resolutions, the 15-minute uplift in kEUR/MW, EUR/MW a day and percent, and the mean cycles a day.
+- `perfect_foresight_meta.json`: the battery parameters, the dates covered, the solve time and the git commit.
+
+Each file is written to a temporary name and renamed once complete. Nothing is written if any day fails to solve.
+
 ## Tests
 
 Run the tests with `uv run pytest`. They run offline.
