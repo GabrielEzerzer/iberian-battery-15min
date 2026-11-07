@@ -62,6 +62,23 @@ The command writes to `$IB15_DATA_DIR/results/`:
 
 Each file is written to a temporary name and renamed once complete. Nothing is written if any day fails to solve.
 
+## Exploratory analysis
+
+```
+uv run ib15 eda    # after `ib15 build`, `ib15 build weather` and `ib15 perfect-foresight`
+```
+
+This writes the tables and figures that describe the data and where the 15-minute value comes from to `$IB15_DATA_DIR/results/eda/`. It stops with an error if `prices_15min.parquet`, `prices_hourly.parquet`, `weather_hourly.parquet` or `perfect_foresight_daily.parquet` is missing. An hour is the group of four consecutive periods of a local delivery day, as in the hourly benchmark, and its within-hour spread is the highest minus the lowest of its four quarter-hour prices. National mean weather is the mean of the ten locations at each UTC hour. Uplift is the 15-minute net value minus the hourly net value of the `main` specification. All correlations are plain Pearson coefficients and are descriptive only.
+
+- `price_summary.csv`: distribution of the Spanish price at 15 minutes and in the hourly benchmark.
+- `within_hour_spread.csv`: within-hour spread overall and by month (mean, median, 90th percentile, share of flat hours) and the mean absolute deviation of a quarter-hour from its hourly mean.
+- `uplift_by_month.csv`: net value at both resolutions and the uplift per month and duration, with that month's mean spread and mean price.
+- `uplift_concentration.csv`: per duration, the share of the total uplift from the top 10% and 25% of days, the share of days with no uplift, the median and mean daily uplift, and the correlation of daily uplift with the day's mean spread and its price range.
+- `weather_summary.csv`: mean, standard deviation, minimum and maximum of each weather variable at each location.
+- `forecast_motivation.csv`: autocorrelation of the price and of the within-hour deviation at lags of one and seven days, and correlations of the price, the within-hour spread and the within-hour slope (last quarter minus first) with the national mean weather. The signed within-hour deviation is uncorrelated with the weather of its hour by construction, since the deviations sum to zero within each hour, so the shape is described by the spread and the slope instead.
+- Figures, each as PNG and PDF: `fig_a` daily mean price and daily mean spread; `fig_b` average price by quarter-hour of day for each season, with the hourly benchmark of one season as steps; `fig_c` mean deviation of each quarter from its hourly mean by hour of day; `fig_d` distribution of the within-hour spread; `fig_e` uplift by month; `fig_f` daily uplift against the day's mean spread; `fig_g` uplift against the wear cost, drawn only when `perfect_foresight_cost_sensitivity.csv` exists; `fig_h` price against national mean radiation and wind.
+- `eda_meta.json`: the inputs with their row counts and date ranges, the outputs, anything skipped, and the git commit.
+
 ## Tests
 
 Run the tests with `uv run pytest`. They run offline.

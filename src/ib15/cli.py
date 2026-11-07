@@ -1,5 +1,5 @@
 """Command line: ``ib15 download omie|weather``, ``ib15 build [prices|weather]`` and
-``ib15 perfect-foresight``."""
+``ib15 perfect-foresight`` and ``ib15 eda``."""
 
 import argparse
 import os
@@ -7,7 +7,7 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from ib15 import battery, dataset, omie, weather
+from ib15 import battery, dataset, eda, omie, weather
 
 ENV_DATA_DIR = "IB15_DATA_DIR"
 
@@ -106,6 +106,22 @@ def _perfect_foresight(args) -> int:
     return 0
 
 
+def _eda(args) -> int:
+    data_dir = _data_dir(args.data_dir)
+    try:
+        meta = eda.run(data_dir)
+    except dataset.BuildError as e:
+        print(f"eda failed:\n{e}", file=sys.stderr)
+        return 1
+    print(
+        f"wrote {len(meta['outputs'])} files in {meta['seconds']} s -> "
+        f"{data_dir / 'results' / 'eda'}"
+    )
+    for s in meta["skipped"]:
+        print(f"  skipped {s}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", help=f"data directory (default: ${ENV_DATA_DIR})")
@@ -152,6 +168,10 @@ def main(argv: list[str] | None = None) -> int:
         help="perfect-foresight battery value at 15-minute and hourly prices",
     )
     pf.set_defaults(func=_perfect_foresight)
+    ed = sub.add_parser(
+        "eda", parents=[common], help="exploratory tables and figures for the paper"
+    )
+    ed.set_defaults(func=_eda)
 
     args = parser.parse_args(argv)
     return args.func(args)
