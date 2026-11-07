@@ -113,6 +113,13 @@ def _text_value(d):
     d["hourly"]["temperature_2m_previous_day2"][3] = "12.1"
 
 
+def _set(var, value):
+    def mutate(d):
+        d["hourly"][f"{var}_previous_day2"][7] = value
+
+    return mutate
+
+
 @pytest.mark.parametrize(
     "body, message",
     [
@@ -129,6 +136,9 @@ def _text_value(d):
         (bad(_not_gmt), "expected 0 (GMT)"),
         (bad(_far_cell), "is not near"),
         (bad(_text_value), "non-numeric"),
+        (bad(_set("temperature_2m", 60.5)), "outside -40.0..60.0 °C"),
+        (bad(_set("wind_speed_100m", -0.1)), "outside 0.0..100.0 m/s"),
+        (bad(_set("shortwave_radiation", 1600)), "outside 0.0..1500.0 W/m²"),
     ],
 )
 def test_parse_rejects(body, message):
@@ -146,6 +156,21 @@ def test_radiation_is_the_mean_of_the_hour_starting_at_valid_time(two_locations)
     # Open-Meteo labels the mean over 11:00-12:00 as 12:00.
     nxt = t + timedelta(hours=1)
     assert row["shortwave_radiation"] == raw_value("madrid", OCT, "shortwave_radiation", nxt)
+
+
+def test_radiation_of_a_files_last_hour_comes_from_the_next_file(tmp_path, monkeypatch):
+    # The real October fixture split into two files at 2025-10-27 00:00, as at a month boundary.
+    monkeypatch.setattr(weather, "LOCATIONS", {"madrid": TWO["madrid"]})
+    d = raw_json("madrid", OCT)
+    d["hourly"]["shortwave_radiation_previous_day2"][48] = 7.0  # first label of the second file
+    for (start, end), sl in [
+        ((OCT[0], date(2025, 10, 26)), slice(0, 48)),
+        ((OCT[1],) * 2, slice(48, None)),
+    ]:
+        part = {**d, "hourly": {k: v[sl] for k, v in d["hourly"].items()}}
+        (tmp_path / weather.file_name("madrid", start, end)).write_text(json.dumps(part))
+    h = weather.load_hourly(tmp_path).set_index("valid_time_utc")
+    assert h.loc[pd.Timestamp("2025-10-26 23:00", tz=UTC), "shortwave_radiation"] == 7.0
 
 
 # --- join -----------------------------------------------------------------------------------
@@ -290,8 +315,9 @@ def test_bid_time_rule_for_the_last_hour_of_the_day(day, last_hour, deadline):
     assert weather.latest_run(label) == datetime.combine(
         day - timedelta(days=1), datetime.min.time(), UTC
     )
-    assert weather.issued_before_bid(label, day)
-    assert not weather.issued_before_bid(label, day, lead_days=1)
+    assert weather.hour_run(last_hour) == weather.latest_run(label)
+    assert weather.issued_before_bid(last_hour, day)
+    assert not weather.issued_before_bid(last_hour, day, lead_days=1)
 
 
 def test_previous_day1_fails_the_rule_in_the_afternoon():
@@ -307,15 +333,28 @@ def test_build_check_fails_when_a_run_is_published_too_late(monkeypatch):
         weather.check_bid_time(p)
 
 
-def test_build_check_reads_the_radiation_label_of_the_hour():
-    # Last hour of 2026-03-30 (CEST) alone: radiation is labelled 22:00, which interpolates
-    # towards 03:00 next day, so the D-1 00 UTC run; the 21:00 label alone would use 18 UTC D-2.
+@pytest.mark.parametrize(
+    "start",
+    [
+        # 21 UTC, the last hour of 2026-03-30 (CEST): radiation is labelled 22:00, which
+        # interpolates towards 03:00 next day (run 00 UTC D-1); label 21:00 is a grid point
+        # (run 18 UTC D-2), so checking only the hour's own label understates the run.
+        "2026-03-30 21:45",
+        # 20 UTC: label 20:00 interpolates towards 00:00 next day (run 00 UTC D-1); radiation's
+        # label 21:00 is a grid point (run 18 UTC D-2), so checking only the radiation label
+        # understates the run.
+        "2026-03-30 20:15",
+    ],
+    ids=["radiation-label-newer", "own-label-newer"],
+)
+def test_build_check_takes_the_newest_run_of_either_label(start):
     one = pd.DataFrame(
         {
-            "delivery_start_utc": [pd.Timestamp("2026-03-30 21:45", tz=UTC)],
+            "delivery_start_utc": [pd.Timestamp(start, tz=UTC)],
             "delivery_date": [date(2026, 3, 30)],
         }
     )
+    # Deadline 10:00 UTC on 2026-03-29 (CEST); the 00 UTC run of that day is public at 08:00.
     assert weather.check_bid_time(one) == pytest.approx(2.0)
 
 
@@ -383,9 +422,13 @@ def test_build_fails_on_overlapping_files(full):
     d = json.loads(src.read_bytes())
     for key in d["hourly"]:
         d["hourly"][key] = d["hourly"][key][24:]
-    (raw / weather.file_name("badajoz", date(2025, 10, 26), OCT[1])).write_text(json.dumps(d))
-    with pytest.raises(BuildError, match="badajoz: duplicate hours"):
+    narrow = weather.file_name("badajoz", date(2025, 10, 26), OCT[1])
+    (raw / narrow).write_text(json.dumps(d))
+    with pytest.raises(BuildError, match="badajoz: duplicate hours") as e:
         weather.build(full)
+    # The message names both files so the user knows which one to delete.
+    assert f"{src.name} and {narrow} overlap in 48 hour(s)" in str(e.value)
+    assert "delete one of the two files" in str(e.value)
 
 
 def test_build_fails_on_unexpected_model_or_location_file(full):

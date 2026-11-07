@@ -26,11 +26,13 @@ real-time IFS dissemination" (ecmwf-api docs; real-time steps 48-57 go out at ab
 We take a run as public ``PUBLISHED_AFTER`` = 8 h after it starts.
 
 Bid-time rule (``issued_before_bid``): every value used for delivery day D must come from a run
-public before 12:00 Europe/Madrid on D-1. For ``_previous_day2`` the latest run any hour of D
-uses is the 00 UTC run of D-1 (the late UTC hours of D interpolate towards points at 00 and
-03 UTC of D+1), public by about 08:00 UTC on D-1; the deadline is 10:00 UTC (CEST) or 11:00 UTC
-(CET). So it holds for every hour of D, DST days included, with about 2 h to spare in summer.
-``_previous_day1`` fails it. The build checks the rule for every hour it joins.
+public before 12:00 Europe/Madrid on D-1. A row reads two labels (see Radiation below), and the
+newest run behind them is not always the later label's (see ``hour_run``). For
+``_previous_day2`` the latest run any hour of D uses is the 00 UTC run of D-1 (the late UTC
+hours of D interpolate towards points at 00 and 03 UTC of D+1), public by about 08:00 UTC on
+D-1; the deadline is 10:00 UTC (CEST) or 11:00 UTC (CET). So it holds for every hour of D,
+DST days included, with about 2 h to spare in summer. ``_previous_day1`` fails it. The build
+checks the rule for every hour it joins.
 
 Radiation: Open-Meteo's ``shortwave_radiation`` at time t is "averaged over the past hour"
 (previous-runs docs), so the mean over the hour starting at H is the value labelled H + 1 h. Every
@@ -62,6 +64,12 @@ VARIABLES = {
     "temperature_2m": ("temp", "°C"),
     "wind_speed_100m": ("wind100", "m/s"),
     "shortwave_radiation": ("ghi", "W/m²"),
+}
+# Physically plausible range per variable, in the units above; a value outside fails parsing.
+LIMITS = {
+    "temperature_2m": (-40.0, 60.0),
+    "wind_speed_100m": (0.0, 100.0),
+    "shortwave_radiation": (0.0, 1500.0),
 }
 # Demand centres, wind areas and solar areas of mainland Spain: name -> (lat, lon).
 LOCATIONS = {
@@ -138,9 +146,20 @@ def bid_deadline(day: date) -> datetime:
     return datetime(d.year, d.month, d.day, 12, tzinfo=MADRID).astimezone(UTC)
 
 
-def issued_before_bid(label: datetime, day: date, lead_days: int = LEAD_DAYS) -> bool:
-    """Whether the value labelled ``label`` was public before the bid deadline for ``day``."""
-    return latest_run(label, lead_days) + PUBLISHED_AFTER < bid_deadline(day)
+def hour_run(hour: datetime, lead_days: int = LEAD_DAYS) -> datetime:
+    """Start (UTC) of the newest run behind any value of the row for the hour starting at
+    ``hour``: temperature and wind read label ``hour``, radiation label ``hour`` + 1 h.
+
+    ``latest_run`` is not monotonic in the label, so both are needed: at 20 UTC, label 20
+    interpolates towards 00 UTC next day (run 00 UTC D-1) while label 21 is a grid point (run
+    18 UTC D-2)."""
+    return max(latest_run(hour, lead_days), latest_run(hour + timedelta(hours=1), lead_days))
+
+
+def issued_before_bid(hour: datetime, day: date, lead_days: int = LEAD_DAYS) -> bool:
+    """Whether every value of the row for the hour starting at ``hour`` was public before the
+    bid deadline for delivery day ``day``."""
+    return hour_run(hour, lead_days) + PUBLISHED_AFTER < bid_deadline(day)
 
 
 # --- parse ----------------------------------------------------------------------------------
@@ -207,6 +226,9 @@ def parse_response(name: str, body: bytes, lat: float, lon: float, start: date, 
             fail(f"{key} has {got} values, expected {n}")
         if bad := [x for x in vals if x is not None and not _number(x)]:
             fail(f"{key} has non-numeric values {bad[:3]}")
+        lo, hi = LIMITS[var]
+        if bad := [x for x in vals if x is not None and not lo <= x <= hi]:
+            fail(f"{key} has {len(bad)} value(s) outside {lo}..{hi} {unit}, first {bad[:3]}")
         values[var] = vals
     return pd.to_datetime(times).tz_localize(UTC), values
 
@@ -238,10 +260,11 @@ def download(
     per location and calendar month, saved unchanged.
 
     Sequential, with ``pause`` seconds between requests. A chunk already saved is skipped once
-    its end is at least two days before today (UTC); a newer one is fetched again, since its
-    last hours may still be null. Every response is validated before it is saved; a bad one is
-    an error and nothing is written. A saved chunk replaces any other file for the same
-    location, model and month.
+    its end is at least two days before today (UTC) and its file is valid with no nulls;
+    otherwise it is fetched again, since a recent chunk's last hours, or a chunk fetched with a
+    future end, may still be null. Every response is validated before it is saved; a bad one is
+    an error and nothing is written. A saved chunk replaces the other files for the same
+    location and model whose range lies inside its own; a wider file is kept.
     """
     fetch = fetch or http_get
     today = today or datetime.now(UTC).date()
@@ -251,7 +274,7 @@ def download(
     for loc, (lat, lon) in LOCATIONS.items():
         for cs, ce in month_chunks(start, end):
             name = file_name(loc, cs, ce)
-            if (raw_dir / name).exists() and ce <= today - SETTLED_AFTER:
+            if ce <= today - SETTLED_AFTER and _complete(raw_dir / name, lat, lon, cs, ce):
                 result.skipped.append(name)
                 continue
             if requests:
@@ -280,12 +303,24 @@ def download(
                     and p.name != name
                     and m["loc"] == loc
                     and m["model"] == MODEL
-                    and m["start"][:7] == f"{cs:%Y-%m}"
+                    and m["start"] >= f"{cs}"
+                    and m["end"] <= f"{ce}"
                 ):
                     p.unlink()
             result.saved.append(name)
             print(f"{name} saved")
     return result
+
+
+def _complete(path: Path, lat: float, lon: float, start: date, end: date) -> bool:
+    """Whether ``path`` exists, is a valid response for start..end and has no nulls."""
+    if not path.exists():
+        return False
+    try:
+        _, values = parse_response(path.name, path.read_bytes(), lat, lon, start, end)
+    except WeatherFormatError:
+        return False
+    return all(None not in vals for vals in values.values())
 
 
 # --- build ----------------------------------------------------------------------------------
@@ -322,16 +357,25 @@ def load_hourly(raw_dir: Path) -> pd.DataFrame:
         except (WeatherFormatError, ValueError) as e:
             errors.append(str(e))
             continue
-        frames[m["loc"]].append(pd.DataFrame(values, index=labels, dtype="float64"))
+        frames[m["loc"]].append((path.name, pd.DataFrame(values, index=labels, dtype="float64")))
     rows = []
     for loc, parts in frames.items():
         if not parts:
             errors.append(f"no raw files for location {loc}")
             continue
-        df = pd.concat(parts).sort_index()
-        if dup := df.index[df.index.duplicated()].unique().tolist():
-            errors.append(f"{loc}: duplicate hours {[str(t) for t in dup[:5]]} ({len(dup)} in all)")
+        # A file has no duplicate hours of its own (parse_response), so any duplicate is an
+        # overlap between two files, e.g. a narrower re-download next to a full month.
+        overlaps = [
+            f"{loc}: duplicate hours, {a} and {b} overlap in {len(both)} hour(s) from {both[0]};"
+            " delete one of the two files"
+            for i, (a, x) in enumerate(parts)
+            for b, y in parts[i + 1 :]
+            if len(both := x.index.intersection(y.index))
+        ]
+        if overlaps:
+            errors.extend(overlaps)
             continue
+        df = pd.concat([x for _, x in parts]).sort_index()
         ghi = df["shortwave_radiation"].reindex(df.index + pd.Timedelta(hours=1))
         df["shortwave_radiation"] = ghi.to_numpy()
         rows.append(df.rename_axis("valid_time_utc").reset_index().assign(location=loc))
@@ -381,8 +425,8 @@ def validate(hourly: pd.DataFrame, hours: pd.DatetimeIndex) -> None:
 
 def check_bid_time(prices: pd.DataFrame) -> float:
     """Raise BuildError if any quarter-hour's weather was not public before its bid deadline.
-    Returns the smallest margin in hours. Each hour is checked at its start plus one hour, the
-    latest label any column reads (radiation)."""
+    Returns the smallest margin in hours. Each hour is checked against the newest run behind
+    either label its row reads (``hour_run``)."""
     pairs = (
         prices.assign(hour=prices["delivery_start_utc"].dt.floor("h"))[["hour", "delivery_date"]]
         .drop_duplicates()
@@ -390,9 +434,9 @@ def check_bid_time(prices: pd.DataFrame) -> float:
     )
     margins, late = [], []
     for hour, day in pairs:
-        label = hour.to_pydatetime() + timedelta(hours=1)
-        margins.append(bid_deadline(day) - (latest_run(label) + PUBLISHED_AFTER))
-        if not issued_before_bid(label, day):
+        h = hour.to_pydatetime()
+        margins.append(bid_deadline(day) - (hour_run(h) + PUBLISHED_AFTER))
+        if not issued_before_bid(h, day):
             late.append(f"{hour} (delivery day {day})")
     if late:
         raise BuildError(

@@ -126,6 +126,32 @@ def test_settled_chunk_on_disk_is_skipped(tmp_path):
     assert fake.requested == [] and len(r.skipped) == 2 and not r.saved
 
 
+def test_settled_chunk_with_nulls_is_fetched_again_and_replaced(tmp_path):
+    # Saved while its end was still in the future: the last hours came back null.
+    d = json.loads(body("madrid", *OCT))
+    d["hourly"]["temperature_2m_previous_day2"][-5:] = [None] * 5
+    with_nulls = weather.file_name("madrid", *OCT)
+    (tmp_path / with_nulls).write_text(json.dumps(d))
+    complete = weather.file_name("sevilla", *OCT)
+    (tmp_path / complete).write_bytes(body("sevilla", *OCT))
+    fake = FakeOpenMeteo()
+    r = run(tmp_path, fake, *OCT, today=date(2025, 11, 7))
+    assert r.saved == [with_nulls] and r.skipped == [complete] and len(fake.requested) == 1
+    assert (tmp_path / with_nulls).read_bytes() == body("madrid", *OCT)
+
+
+def test_narrower_rerun_keeps_the_wider_file_and_deletes_a_covered_one(tmp_path):
+    full = weather.file_name("madrid", date(2025, 10, 1), date(2025, 10, 31))
+    (tmp_path / full).write_bytes(body("madrid", date(2025, 10, 1), date(2025, 10, 31)))
+    covered = weather.file_name("sevilla", date(2025, 10, 20), date(2025, 10, 25))
+    (tmp_path / covered).write_bytes(body("sevilla", date(2025, 10, 20), date(2025, 10, 25)))
+    r = run(tmp_path, FakeOpenMeteo(), date(2025, 10, 15), date(2025, 10, 31))
+    assert not r.errors and len(r.saved) == 2
+    narrow = [weather.file_name(loc, date(2025, 10, 15), date(2025, 10, 31)) for loc in TWO]
+    # Oct 1-14 survive in the wider madrid file; the sevilla file inside the new range is gone.
+    assert names(tmp_path) == sorted([full, *narrow])
+
+
 def test_recent_chunk_is_fetched_again_and_replaces_the_shorter_file(tmp_path):
     old = weather.file_name("madrid", date(2025, 10, 25), date(2025, 10, 26))
     (tmp_path / old).write_bytes(body("madrid", date(2025, 10, 25), date(2025, 10, 26)))
