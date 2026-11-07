@@ -57,10 +57,11 @@ The battery has 1 MW of power and 1, 2 or 4 hours of storage (1, 2 or 4 MWh). It
 The command writes to `$IB15_DATA_DIR/results/`:
 
 - `perfect_foresight_daily.parquet`: one row per delivery day, duration, specification and resolution, with gross revenue, degradation cost and net value in EUR per MW, MWh discharged, full cycles, and the number of periods in which the solution both charges and discharges. Charging and discharging share the 1 MW converter, so together they never exceed 1 MW in a period; a period with both stands for the battery alternating between them within it, which burns energy in the losses and is worth doing only at negative prices.
-- `perfect_foresight_summary.csv`: for each duration and specification, the net and gross value over the whole sample at both resolutions, the 15-minute uplift in kEUR/MW, EUR/MW a day and percent, and the mean cycles a day.
-- `perfect_foresight_meta.json`: the battery parameters, the dates covered, the solve time and the git commit.
+- `perfect_foresight_summary.csv`: for each duration and specification, the net and gross value over the whole sample at both resolutions, the 15-minute uplift in kEUR/MW, EUR/MW a day and percent, the degradation cost at both resolutions, and the mean cycles a day. A percent uplift is empty (NaN) when the hourly total is zero.
+- `perfect_foresight_cost_sensitivity.csv`: the same columns for the setting without a cycle cap at degradation costs of 0, 10, 20, 30 and 40 EUR per MWh discharged, one row per duration and cost. The 20 and 0 rows are the `main` and `no_cost` rows of the summary, taken from the same solves.
+- `perfect_foresight_meta.json`: the battery parameters, the cost grid of the sensitivity, the dates covered, the solve time and the git commit.
 
-Each file is written to a temporary name and renamed once complete. Nothing is written if any day fails to solve.
+Every file is first written to a temporary `.part` name, and the files are renamed only once all of them are complete, so a failed run leaves the previous results as they were. Nothing is written if any day fails to solve.
 
 ## Tests
 

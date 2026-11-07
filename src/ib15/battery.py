@@ -17,6 +17,7 @@ quarter-hours), so its schedule is feasible at 15 minutes and earns the same the
 import json
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +50,18 @@ SPECS = (
     Spec("no_cost", 0.0, None),
     Spec("cap2", 0.0, 2.0),
 )
+
+# Wear costs (EUR per MWh discharged) for the no-cap sensitivity. A cost that an existing no-cap
+# spec already has reuses that spec's solves, so 0 and 20 are the no_cost and main rows.
+SENSITIVITY_COSTS = (0.0, 10.0, 20.0, 30.0, 40.0)
+SENSITIVITY_SPECS = tuple(
+    next(
+        (s for s in SPECS if s.max_cycles is None and s.cost_per_mwh == cost),
+        Spec(f"cost_{cost:g}", cost, None),
+    )
+    for cost in SENSITIVITY_COSTS
+)
+SOLVED_SPECS = SPECS + tuple(s for s in SENSITIVITY_SPECS if s not in SPECS)
 
 
 class SolveError(Exception):
@@ -116,7 +129,9 @@ def solve_day(prices, dt: float, energy_mwh: float, spec: Spec) -> Dispatch:
         net=gross - degradation,
         discharged_mwh=discharged,
         # Periods in which the battery time-shares its converter between charging and
-        # discharging (both positive, together at most POWER_MW).
+        # discharging (both positive, together at most POWER_MW). With a 0 EUR/MWh cost some of
+        # these can be the solver's tie-breaking: in a zero-price period, charging and
+        # discharging at once leaves the objective unchanged, so either solution is optimal.
         simultaneous=int(np.sum((c > SIMULTANEOUS_TOL) & (d > SIMULTANEOUS_TOL))),
     )
 
@@ -139,7 +154,7 @@ def daily_values(q: pd.DataFrame, h: pd.DataFrame) -> pd.DataFrame:
             raise BuildError(f"{day}: an hourly price is not the mean of its four quarter-hours")
         for hours in DURATIONS_H:
             energy = POWER_MW * hours
-            for spec in SPECS:
+            for spec in SOLVED_SPECS:
                 for resolution, prices, dt in (("15min", pq, DT_15MIN), ("hourly", ph, DT_HOURLY)):
                     r = solve_day(prices, dt, energy, spec)
                     rows.append(
@@ -159,38 +174,64 @@ def daily_values(q: pd.DataFrame, h: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _compare(daily: pd.DataFrame, hours: int, spec: Spec) -> dict:
+    """Sample totals at both resolutions for one (duration_h, spec), the 15-minute uplift and
+    mean cycles a day. Percent uplift is NaN when the hourly total is zero."""
+    g = daily[(daily["duration_h"] == hours) & (daily["spec"] == spec.name)]
+    r15 = g[g["resolution"] == "15min"].set_index("delivery_date")
+    rh = g[g["resolution"] == "hourly"].set_index("delivery_date")
+    if not r15.index.sort_values().equals(rh.index.sort_values()):
+        raise BuildError(f"{hours} h {spec.name}: resolutions cover different days")
+    days = len(r15)
+    row = {"days": days}
+    for label in ("net", "gross"):
+        v15 = r15[f"{label}_eur_per_mw"].sum()
+        vh = rh[f"{label}_eur_per_mw"].sum()
+        row[f"{label}_15min_keur_per_mw"] = v15 / 1000
+        row[f"{label}_hourly_keur_per_mw"] = vh / 1000
+        row[f"{label}_uplift_keur_per_mw"] = (v15 - vh) / 1000
+        row[f"{label}_uplift_eur_per_mw_day"] = (v15 - vh) / days
+        row[f"{label}_uplift_pct"] = 100 * (v15 - vh) / vh if vh != 0 else math.nan
+    row["degradation_15min_keur_per_mw"] = r15["degradation_eur_per_mw"].sum() / 1000
+    row["degradation_hourly_keur_per_mw"] = rh["degradation_eur_per_mw"].sum() / 1000
+    row["cycles_per_day_15min"] = r15["cycles"].mean()
+    row["cycles_per_day_hourly"] = rh["cycles"].mean()
+    return row
+
+
 def summarise(daily: pd.DataFrame) -> pd.DataFrame:
-    """Per (duration_h, spec): sample totals at both resolutions, the 15-minute uplift and mean
-    cycles a day."""
-    rows = []
-    for hours in DURATIONS_H:
-        for spec in SPECS:
-            g = daily[(daily["duration_h"] == hours) & (daily["spec"] == spec.name)]
-            r15 = g[g["resolution"] == "15min"].set_index("delivery_date")
-            rh = g[g["resolution"] == "hourly"].set_index("delivery_date")
-            if not r15.index.sort_values().equals(rh.index.sort_values()):
-                raise BuildError(f"{hours} h {spec.name}: resolutions cover different days")
-            days = len(r15)
-            row = {"duration_h": hours, "spec": spec.name, "days": days}
-            for label in ("net", "gross"):
-                v15 = r15[f"{label}_eur_per_mw"].sum()
-                vh = rh[f"{label}_eur_per_mw"].sum()
-                row[f"{label}_15min_keur_per_mw"] = v15 / 1000
-                row[f"{label}_hourly_keur_per_mw"] = vh / 1000
-                row[f"{label}_uplift_keur_per_mw"] = (v15 - vh) / 1000
-                row[f"{label}_uplift_eur_per_mw_day"] = (v15 - vh) / days
-                row[f"{label}_uplift_pct"] = 100 * (v15 - vh) / vh
-            row["cycles_per_day_15min"] = r15["cycles"].mean()
-            row["cycles_per_day_hourly"] = rh["cycles"].mean()
-            rows.append(row)
-    return pd.DataFrame(rows)
+    """One row per (duration_h, spec) of SPECS, from ``_compare``."""
+    return pd.DataFrame(
+        [
+            {"duration_h": hours, "spec": spec.name} | _compare(daily, hours, spec)
+            for hours in DURATIONS_H
+            for spec in SPECS
+        ]
+    )
 
 
-def _write(path: Path, write) -> None:
-    """Write through a temporary file and rename, so a failure never leaves half a file."""
-    tmp = path.with_name(path.name + ".part")
-    write(tmp)
-    tmp.replace(path)
+def cost_sensitivity(daily: pd.DataFrame) -> pd.DataFrame:
+    """One row per (duration_h, cost_eur_per_mwh) of the no-cap wear-cost grid."""
+    return pd.DataFrame(
+        [
+            {"duration_h": hours, "cost_eur_per_mwh": spec.cost_per_mwh}
+            | _compare(daily, hours, spec)
+            for hours in DURATIONS_H
+            for spec in SENSITIVITY_SPECS
+        ]
+    )
+
+
+def _write_all(files: dict[Path, Callable[[Path], object]]) -> None:
+    """Write every file to a ``.part`` name beside it, then rename them all, so a failure while
+    writing leaves the previous set intact. A ``.part`` left by a failed run is overwritten."""
+    parts = []
+    for path, write in files.items():
+        tmp = path.with_name(path.name + ".part")
+        write(tmp)
+        parts.append((tmp, path))
+    for tmp, path in parts:
+        tmp.replace(path)
 
 
 def perfect_foresight(data_dir: Path) -> dict:
@@ -205,6 +246,7 @@ def perfect_foresight(data_dir: Path) -> dict:
     started = time.perf_counter()
     daily = daily_values(q, h)
     summary = summarise(daily)
+    sensitivity = cost_sensitivity(daily)
     status = _git("status", "--porcelain")
     meta = {
         "power_mw": POWER_MW,
@@ -221,6 +263,7 @@ def perfect_foresight(data_dir: Path) -> dict:
             }
             for s in SPECS
         },
+        "cost_sensitivity_eur_per_mwh_discharged": list(SENSITIVITY_COSTS),
         "hourly": "one charge and discharge power per hour at the hourly price (mean of quarters)",
         "solver": "scipy.optimize.linprog, method highs",
         "simultaneous_tolerance_mw": SIMULTANEOUS_TOL,
@@ -241,10 +284,16 @@ def perfect_foresight(data_dir: Path) -> dict:
     }
     out = data_dir / "results"
     out.mkdir(parents=True, exist_ok=True)
-    _write(out / "perfect_foresight_daily.parquet", lambda t: daily.to_parquet(t, index=False))
-    _write(out / "perfect_foresight_summary.csv", lambda t: summary.to_csv(t, index=False))
-    _write(
-        out / "perfect_foresight_meta.json",
-        lambda t: t.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8"),
+    _write_all(
+        {
+            out / "perfect_foresight_daily.parquet": lambda t: daily.to_parquet(t, index=False),
+            out / "perfect_foresight_summary.csv": lambda t: summary.to_csv(t, index=False),
+            out / "perfect_foresight_cost_sensitivity.csv": lambda t: sensitivity.to_csv(
+                t, index=False
+            ),
+            out / "perfect_foresight_meta.json": lambda t: t.write_text(
+                json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+            ),
+        }
     )
     return meta
