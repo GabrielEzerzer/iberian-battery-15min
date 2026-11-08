@@ -578,11 +578,15 @@ def test_uncertainty_estimates_are_the_summary_values(tmp_path):
 
 
 def test_the_interval_collapses_when_every_day_is_the_same():
-    daily = pf_daily(np.full(30, 130.0), np.full(30, 100.0))
+    daily = pf_daily(np.full(30, 150.0), np.full(30, 120.0))
     unc = uncertainty(daily, summarise(daily))
     assert np.allclose(unc["ci_low"], unc["estimate"], rtol=1e-12, atol=0)
     assert np.allclose(unc["ci_high"], unc["estimate"], rtol=1e-12, atol=0)
-    assert set(unc["estimate"].round(9)) == {30.0}  # 30 EUR/MW a day, 30 % of the hourly value
+    # 30 EUR/MW a day, 25% of the hourly value.
+    assert unc.groupby("statistic")["estimate"].first().round(9).to_dict() == {
+        "net_uplift_eur_per_mw_day": 30.0,
+        "net_uplift_pct": 25.0,
+    }
 
 
 def test_the_interval_matches_the_normal_one_for_independent_days():
