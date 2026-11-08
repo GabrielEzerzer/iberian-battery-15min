@@ -19,6 +19,7 @@ OUTPUTS = {
     "forecast_dm_tests.csv",
     "forecast_value_daily.parquet",
     "forecast_value_summary.csv",
+    "forecast_window_sensitivity.csv",
     "forecast_meta.json",
 }
 
@@ -110,6 +111,25 @@ def test_window_reaches_back_exactly_63_days(long_frame):
     assert not np.allclose(forecast_for(edge, day)["expert"], base["expert"])
 
 
+@pytest.mark.parametrize("window", forecast.SENSITIVITY_WINDOWS)
+def test_each_sensitivity_window_reaches_back_exactly_its_length_plus_7_days(long_frame, window):
+    dates, p, w, _ = forecast.slot_arrays(long_frame)
+    t = dates.index(date(2026, 1, 14))
+    reach = window + 7
+
+    def expert(prices):
+        fc = forecast.forecast_slots(dates, prices, w, [t], window)
+        return fc["expert"][0], fc["expert_weather"][0]
+
+    base = expert(p)
+    older = p.copy()
+    older[: t - reach] += 100.0
+    assert all(np.array_equal(a, b) for a, b in zip(expert(older), base, strict=True))
+    edge = p.copy()
+    edge[t - reach] += 100.0
+    assert not any(np.allclose(a, b) for a, b in zip(expert(edge), base, strict=True))
+
+
 # ---------------------------------------------------------------- 3, 4: models
 
 
@@ -120,6 +140,15 @@ def test_window_reaches_back_exactly_63_days(long_frame):
         (date(2026, 1, 17), 7),  # Saturday
         (date(2026, 1, 18), 7),  # Sunday
         (date(2026, 1, 14), 1),  # Wednesday
+        # Holidays copy the most recent Sunday before them.
+        (date(2025, 12, 8), 1),  # Monday holiday: Sunday 7 December
+        (date(2025, 12, 6), 6),  # Saturday holiday: Sunday 30 November
+        (date(2025, 12, 25), 4),  # Thursday holiday: Sunday 21 December
+        (date(2026, 1, 6), 2),  # Tuesday holiday: Sunday 4 January
+        # The day after a holiday follows the ordinary rule.
+        (date(2025, 12, 9), 1),  # Tuesday after the Monday holiday
+        (date(2025, 12, 26), 1),  # Friday after the Thursday holiday
+        (date(2026, 1, 7), 1),  # Wednesday after the Tuesday holiday
     ],
 )
 def test_naive_rule(long_frame, day, lag):
@@ -127,8 +156,37 @@ def test_naive_rule(long_frame, day, lag):
     assert np.array_equal(got, day_prices(long_frame, day - timedelta(days=lag)))
 
 
+@pytest.mark.parametrize(
+    "day, dummies",
+    [
+        (date(2025, 12, 8), (0, 0, 1)),  # holiday on a Monday
+        (date(2025, 12, 25), (0, 0, 1)),  # holiday on a Thursday
+        (date(2025, 12, 15), (1, 0, 0)),  # ordinary Monday
+        (date(2025, 12, 18), (0, 0, 0)),  # ordinary Thursday
+    ],
+)
+def test_a_holiday_has_the_sunday_dummies(long_frame, day, dummies):
+    dates, p, w, _ = forecast.slot_arrays(long_frame)
+    cols = [forecast.EXPERT_FEATURES.index(k) for k in ("Monday", "Saturday", "Sunday")]
+    for f in (forecast.features(dates, p), forecast.features(dates, p, w)):
+        row = f[dates.index(day)][:, cols]
+        assert (row == dummies).all()
+
+
+def test_the_holiday_list():
+    hol = forecast.HOLIDAYS
+    assert all(isinstance(d, date) and 2025 <= d.year <= 2026 for d in hol)
+    assert len(set(hol)) == len(hol)
+    assert list(hol) == sorted(hol)
+    for d in ("2025-01-01", "2026-01-01", "2025-05-01", "2026-05-01", "2025-10-12", "2026-10-12"):
+        assert date.fromisoformat(d) in hol, d
+    # Holy Thursday is not held in Cataluña or the Comunitat Valenciana.
+    assert date(2026, 4, 2) not in hol
+
+
 def noise_free(with_weather: bool):
-    """Prices generated without noise from the expert equation (plus weather terms), per slot."""
+    """Prices generated without noise from the expert equation (plus weather terms), per slot.
+    A holiday has the Sunday dummies."""
     rng = np.random.default_rng(1)
     n = 70
     dates = [date(2025, 11, 3) + timedelta(days=i) for i in range(n)]
@@ -147,7 +205,8 @@ def noise_free(with_weather: bool):
     w = rng.normal(size=(n, 96, 3)) * [5, 3, 200] + [15, 6, 200]
     gamma = rng.uniform(-1, 1, (96, 3)) * [1, 1, 0.05]
     for j in range(7, n):
-        prev, wd = p[j - 1], dates[j].weekday()
+        prev = p[j - 1]
+        wd = 6 if dates[j] in forecast.HOLIDAYS else dates[j].weekday()
         x = np.column_stack(
             [np.ones(96), prev, p[j - 2], p[j - 7]]
             + [np.full(96, v) for v in (prev.min(), prev.max(), prev[-1])]
@@ -287,15 +346,77 @@ def test_newey_west_lag_0_is_the_plain_variance():
     assert forecast.newey_west_variance(d, 0) == pytest.approx(np.var(d), rel=1e-12)
 
 
+def test_dm_tests_report_every_lag_and_the_main_lag_is_the_main_test():
+    rng = np.random.default_rng(6)
+    days = [date(2026, 1, 1) + timedelta(days=i) for i in range(60)]
+    fc = pd.DataFrame({"delivery_date": np.repeat(days, 4)})
+    fc["price_es"] = rng.normal(60, 30, len(fc))
+    for m in MODELS:
+        fc[m] = fc["price_es"] + rng.normal(0, 10, len(fc))
+    dm = forecast.dm_tests(fc)
+    assert forecast.DM_LAG == 7
+    for a, b in (("expert", "naive"), ("expert_weather", "expert")):
+        rows = dm[(dm["model_a"] == a) & (dm["model_b"] == b)].set_index("newey_west_lag")
+        assert list(rows.index) == [7, 14, 28]
+        main = forecast.dm_test(forecast.daily_mae(fc, a), forecast.daily_mae(fc, b), lag=7)
+        assert main.pop("newey_west_lag") == 7
+        for k, v in main.items():
+            assert rows.loc[7, k] == pytest.approx(v, rel=1e-12), k
+        assert rows.loc[14, "dm_stat"] != pytest.approx(rows.loc[7, "dm_stat"])
+
+
+def hourly_prices(pw: pd.DataFrame) -> dict:
+    cols = ["delivery_start_utc", "delivery_date", "period", "price_es", "price_pt"]
+    h = hourly_benchmark(pw[cols + ["source_version"]])
+    return {d: g["price_es"].to_numpy() for d, g in h.groupby("delivery_date")}
+
+
+def test_the_56_day_sensitivity_row_is_the_main_model_on_the_common_days():
+    first = forecast.first_eval(max(forecast.SENSITIVITY_WINDOWS))
+    pw = frame(date(2025, 9, 1), first + 2, seed=8)
+    hourly = hourly_prices(pw)
+    sens, days = forecast.window_sensitivity(pw, hourly)
+    assert days == sorted(pw["delivery_date"].unique())[first:]
+    assert len(sens) == len(battery.DURATIONS_H) * 2 * len(forecast.SENSITIVITY_WINDOWS)
+
+    # The main 56-day forecasts, cut to the common days and valued as the main run does.
+    fc = forecast.forecast_periods(pw)
+    fc = fc[fc["delivery_date"] >= days[0]].reset_index(drop=True)
+    rows = []
+    for day, g in fc.groupby("delivery_date", sort=True):
+        plans = {m: g[m].to_numpy() for m in MODELS}
+        rows += forecast.day_values(day, g["price_es"].to_numpy(), hourly[day], plans)
+    main = forecast.summarise(pd.DataFrame(rows)).set_index(["duration_h", "model"])
+    s = sens.set_index(["duration_h", "model", "window_days"])
+    cols = [
+        "days",
+        "net_capture_15min_pct",
+        "net_capture_hourly_pct",
+        "net_uplift_eur_per_mw_day",
+        "net_uplift_capture_pct",
+    ]
+    for hours in battery.DURATIONS_H:
+        for m in forecast.SENSITIVITY_MODELS:
+            mae = (fc[m] - fc["price_es"]).abs().mean()
+            assert s.loc[(hours, m, 56), "mae_15min"] == pytest.approx(mae, rel=1e-12)
+            for c in cols:
+                assert s.loc[(hours, m, 56), c] == pytest.approx(main.loc[(hours, m), c]), c
+            # The other windows are really other fits.
+            for win in (28, 112):
+                assert s.loc[(hours, m, win), "mae_15min"] != pytest.approx(mae)
+
+
 # ---------------------------------------------------------------- 8: inputs and writing
 
 
-# The three evaluation days of write_data_dir are Friday 5, Saturday 6 and Sunday 7 December.
-START = date(2025, 10, 3)
+# write_data_dir's main evaluation runs from 8 October to Sunday 7 December 2025 (61 days); the
+# window sensitivity's from Wednesday 3 December (5 days). 6 December is a holiday (a Saturday).
+START = date(2025, 8, 6)
+NDAYS = forecast.first_eval(max(forecast.SENSITIVITY_WINDOWS)) + 5
 
 
-def write_data_dir(root: Path, ndays: int = forecast.FIRST_EVAL + 3) -> None:
-    pw = frame(START, ndays, seed=7)
+def write_data_dir(root: Path, ndays: int = NDAYS, start: date = START) -> None:
+    pw = frame(start, ndays, seed=7)
     q = pw[["delivery_start_utc", "delivery_date", "period", "price_es", "price_pt"]].assign(
         source_version=1
     )
@@ -316,13 +437,21 @@ def test_run_writes_every_output(tmp_path):
     out = tmp_path / "results" / "forecast"
     assert set(files_in(out)) == OUTPUTS
     meta = json.loads((out / "forecast_meta.json").read_text(encoding="utf-8"))
+    days = NDAYS - forecast.FIRST_EVAL
     assert meta["evaluation"]["start"] == str(START + timedelta(days=63))
-    assert meta["evaluation"]["days"] == 3
+    assert meta["evaluation"]["days"] == days
+    assert meta["holidays"]["dates"] == [str(d) for d in forecast.HOLIDAYS]
+    assert meta["dm_test"]["lag_days"] == 7
+    assert meta["dm_test"]["sensitivity_lags_days"] == [7, 14, 28]
+    sens_meta = meta["window_sensitivity"]
+    assert sens_meta["windows_days"] == [28, 56, 112]
+    assert (sens_meta["start"], sens_meta["days"]) == ("2025-12-03", 5)
     fc = pd.read_parquet(out / "forecasts_15min.parquet")
-    assert len(fc) == 3 * 96 and set(MODELS) <= set(fc.columns)
-    # Each day's naive column is the input price of D-1 on Friday and of D-7 at the weekend.
+    assert fc["delivery_date"].nunique() == days and set(MODELS) <= set(fc.columns)
+    # The naive column is the input price of D-1 on Friday, of the last Sunday on the Saturday
+    # holiday and of D-7 on Sunday.
     pw = pd.read_parquet(tmp_path / "dataset" / "prices_weather_15min.parquet")
-    for day, lag in ((date(2025, 12, 5), 1), (date(2025, 12, 6), 7), (date(2025, 12, 7), 7)):
+    for day, lag in ((date(2025, 12, 5), 1), (date(2025, 12, 6), 6), (date(2025, 12, 7), 7)):
         got = fc.loc[fc["delivery_date"] == day, "naive"].to_numpy()
         assert np.array_equal(got, day_prices(pw, day - timedelta(days=lag))), day
     s = pd.read_csv(out / "forecast_value_summary.csv")
@@ -331,8 +460,13 @@ def test_run_writes_every_output(tmp_path):
     assert np.allclose(perfect[["net_capture_15min_pct", "net_capture_hourly_pct"]], 100)
     assert np.allclose(perfect["net_uplift_capture_pct"], 100)
     assert (s["net_capture_15min_pct"] <= 100 + 1e-6).all()
+    sens = pd.read_csv(out / "forecast_window_sensitivity.csv")
+    assert len(sens) == len(battery.DURATIONS_H) * 2 * 3 and (sens["days"] == 5).all()
+    assert (sens["net_capture_15min_pct"] <= 100 + 1e-6).all()
+    dm = pd.read_csv(out / "forecast_dm_tests.csv")
+    assert sorted(dm["newey_west_lag"]) == [7, 7, 14, 14, 28, 28]
     daily = pd.read_parquet(out / "forecast_value_daily.parquet")
-    assert len(daily) == 3 * len(battery.DURATIONS_H) * 4 * 2
+    assert len(daily) == days * len(battery.DURATIONS_H) * 4 * 2
     # The uplift columns, recomputed from the daily values.
     net = daily.pivot_table(
         index=["duration_h", "model"], columns="resolution", values="net_eur_per_mw", aggfunc="sum"
@@ -342,7 +476,7 @@ def test_run_writes_every_output(tmp_path):
         row = s[(s["duration_h"] == hours) & (s["model"] == "expert")].iloc[0]
         u = up[(hours, "expert")]
         assert row["net_uplift_keur_per_mw"] == pytest.approx(u / 1000)
-        assert row["net_uplift_eur_per_mw_day"] == pytest.approx(u / 3)
+        assert row["net_uplift_eur_per_mw_day"] == pytest.approx(u / days)
         assert row["net_uplift_capture_pct"] == pytest.approx(100 * u / up[(hours, "perfect")])
 
 
@@ -368,9 +502,17 @@ def test_a_missing_price_column_in_the_weather_file_stops_the_run(tmp_path, caps
 
 
 def test_too_few_days_for_one_evaluation_day_stops_the_run(tmp_path, capsys):
-    write_data_dir(tmp_path, ndays=forecast.FIRST_EVAL)
+    # The longest sensitivity window (112 days, with lags back 7) needs 120 days.
+    write_data_dir(tmp_path, ndays=forecast.first_eval(max(forecast.SENSITIVITY_WINDOWS)))
     assert cli.main(["forecast", "--data-dir", str(tmp_path)]) == 1
-    assert "at least 64" in capsys.readouterr().err
+    assert "at least 120" in capsys.readouterr().err
+    assert not (tmp_path / "results").exists()
+
+
+def test_days_outside_the_holiday_list_stop_the_run(tmp_path, capsys):
+    write_data_dir(tmp_path, start=date(2024, 9, 1))
+    assert cli.main(["forecast", "--data-dir", str(tmp_path)]) == 1
+    assert "holiday list covers 2025-2026 only" in capsys.readouterr().err
     assert not (tmp_path / "results").exists()
 
 

@@ -11,15 +11,15 @@ Every day is represented by its 96 local wall-clock quarter-hours (Europe/Madrid
 day the repeated hour's two occurrences are averaged. A forecast is mapped back to the day's real
 periods: both occurrences of a repeated hour get the slot forecast, and a missing hour is dropped.
 
-Models, each forecasting every slot of D:
-- ``naive``: the same slot on D-7 for Monday, Saturday and Sunday, on D-1 otherwise.
+A national public holiday (HOLIDAYS) is treated as a Sunday. Models, each forecasting every
+slot of D:
+- ``naive``: on a holiday, the same slot on the most recent Sunday before D; otherwise the same
+  slot on D-7 for Monday, Saturday and Sunday, on D-1 for the other weekdays.
 - ``expert``: one least-squares regression per slot s, fitted on the WINDOW_DAYS days before D:
   intercept, the price of slot s on D-1, D-2 and D-7, the minimum, maximum and last slot of D-1,
-  and Monday, Saturday and Sunday dummies.
+  and Monday, Saturday and Sunday dummies (on a holiday: Sunday 1, Monday and Saturday 0).
 - ``expert_weather``: ``expert`` plus the national mean (of the ten locations) temperature,
   100 m wind speed and radiation for slot s on D.
-shortcut: public holidays are not modelled (they are treated as the weekday they fall on); add a
-holiday dummy if the errors on holidays dominate.
 
 The hourly forecast is the mean of each hour's four quarter-hour forecasts. The battery (the
 ``main`` spec) plans each day on the forecast and is paid the actual prices.
@@ -44,10 +44,61 @@ from ib15.weather import LOCATIONS, VARIABLES
 SLOTS = 96
 WINDOW_DAYS = 56  # fixed in advance, not tuned
 LAGS = (1, 2, 7)
-# The oldest training day of the first forecast (D-WINDOW_DAYS) needs its D-7 lag.
-FIRST_EVAL = WINDOW_DAYS + max(LAGS)  # index of the first evaluation day (0-based)
+
+
+def first_eval(window: int) -> int:
+    """Index (0-based) of the first day a ``window``-day fit can forecast: the oldest training
+    day (D-window) needs its D-7 lag."""
+    return window + max(LAGS)
+
+
+FIRST_EVAL = first_eval(WINDOW_DAYS)
 MODELS = ("naive", "expert", "expert_weather")
 NAIVE_WEEKLY = (0, 5, 6)  # Monday, Saturday, Sunday use the same slot a week earlier
+SENSITIVITY_WINDOWS = (28, 56, 112)  # training windows of the robustness check, in days
+SENSITIVITY_MODELS = ("expert", "expert_weather")
+# Spain's national public holidays that are holidays in every autonomous community and in Ceuta
+# and Melilla, treated as Sundays. Source: the annex of the Dirección General de Trabajo's yearly
+# resolution; a day is kept when every one of its 19 columns marks it "*" (national, not
+# substitutable) or "**" (national, not substituted by the community):
+# - 2025: Resolución de 15 de octubre de 2024, BOE of 18-10-2024,
+#   https://www.boe.es/diario_boe/txt.php?id=BOE-A-2024-21316
+# - 2026: Resolución de 17 de octubre de 2025, BOE of 28-10-2025,
+#   https://www.boe.es/diario_boe/txt.php?id=BOE-A-2025-21667
+# The annexes list no Sundays. 12 October 2025, 1 November 2026 and 6 December 2026 fall on a
+# Sunday; they are national holidays no community can substitute (art. 45.1 of Real Decreto
+# 2001/1983, BOE-A-1983-20906), so they are included, and treating them as a Sunday changes
+# nothing. Left out because some communities do not hold them: Holy Thursday (17-04-2025,
+# 02-04-2026; not in Cataluña or the Comunitat Valenciana), 19 March and 25 July (each held in
+# some communities only), the Mondays after a Sunday holiday (13-10-2025, 02-11-2026,
+# 07-12-2026; only some communities moved the rest day there), and the communities' own
+# holidays (Easter Monday, 26 December and the regional days).
+HOLIDAYS = tuple(
+    date.fromisoformat(d)
+    for d in (
+        "2025-01-01",
+        "2025-01-06",
+        "2025-04-18",
+        "2025-05-01",
+        "2025-08-15",
+        "2025-10-12",
+        "2025-11-01",
+        "2025-12-06",
+        "2025-12-08",
+        "2025-12-25",
+        "2026-01-01",
+        "2026-01-06",
+        "2026-04-03",
+        "2026-05-01",
+        "2026-08-15",
+        "2026-10-12",
+        "2026-11-01",
+        "2026-12-06",
+        "2026-12-08",
+        "2026-12-25",
+    )
+)
+HOLIDAY_YEARS = (HOLIDAYS[0].year, HOLIDAYS[-1].year)
 EXPERT_FEATURES = (
     "intercept",
     "price same slot D-1",
@@ -62,6 +113,7 @@ EXPERT_FEATURES = (
 )
 WEATHER_FEATURES = tuple(f"national mean {v}, same slot on D" for v in VARIABLES)
 DM_LAG = 7  # Newey-West lag (days) of the Diebold-Mariano variance
+DM_LAGS = (DM_LAG, 14, 28)  # the lags reported in forecast_dm_tests.csv
 SPEC = next(s for s in battery.SPECS if s.name == "main")
 BOUND_TOL = 1e-6  # EUR/MW; perfect foresight may not fall further below a forecast's value
 PRICE_COLUMNS = ["delivery_start_utc", "delivery_date", "period", "price_es"]
@@ -120,6 +172,11 @@ def slot_arrays(pw: pd.DataFrame):
 # ---------------------------------------------------------------- models
 
 
+def day_type(d: date) -> int:
+    """The weekday the models see (Monday 0 .. Sunday 6): a national holiday counts as Sunday."""
+    return 6 if d in HOLIDAYS else d.weekday()
+
+
 def features(dates: list[date], p: np.ndarray, w: np.ndarray | None = None) -> np.ndarray:
     """Regressors of every slot of every day, shape (days, 96, k); NaN for the first 7 days.
     Row j uses only prices of days before j and, with ``w``, the weather of day j."""
@@ -128,7 +185,7 @@ def features(dates: list[date], p: np.ndarray, w: np.ndarray | None = None) -> n
     f = np.full((n, SLOTS, k), np.nan)
     for j in range(max(LAGS), n):
         prev = p[j - 1]
-        wd = dates[j].weekday()
+        wd = day_type(dates[j])
         cols = [
             np.ones(SLOTS),
             prev,
@@ -147,39 +204,45 @@ def features(dates: list[date], p: np.ndarray, w: np.ndarray | None = None) -> n
     return f
 
 
-def ols_forecast(f: np.ndarray, p: np.ndarray, t: int) -> np.ndarray:
-    """Per slot, least squares on days t-WINDOW_DAYS..t-1, applied to day t's regressors."""
-    if t < FIRST_EVAL:
-        raise ValueError(f"day {t} has no full window; the first is {FIRST_EVAL}")
+def ols_forecast(f: np.ndarray, p: np.ndarray, t: int, window: int = WINDOW_DAYS) -> np.ndarray:
+    """Per slot, least squares on days t-window..t-1, applied to day t's regressors."""
+    if t < first_eval(window):
+        raise ValueError(f"day {t} has no full window; the first is {first_eval(window)}")
     out = np.empty(SLOTS)
     for s in range(SLOTS):
-        beta = np.linalg.lstsq(f[t - WINDOW_DAYS : t, s], p[t - WINDOW_DAYS : t, s], rcond=None)[0]
+        beta = np.linalg.lstsq(f[t - window : t, s], p[t - window : t, s], rcond=None)[0]
         out[s] = f[t, s] @ beta
     return out
 
 
 def naive_forecast(dates: list[date], p: np.ndarray, t: int) -> np.ndarray:
+    if dates[t] in HOLIDAYS:
+        return p[t - (dates[t].weekday() + 1)]  # the most recent Sunday before D
     return p[t - 7] if dates[t].weekday() in NAIVE_WEEKLY else p[t - 1]
 
 
 def forecast_slots(
-    dates: list[date], p: np.ndarray, w: np.ndarray, targets
+    dates: list[date], p: np.ndarray, w: np.ndarray, targets, window: int = WINDOW_DAYS
 ) -> dict[str, np.ndarray]:
     """Each model's slot forecasts for the target day indices, shape (len(targets), 96)."""
     f_expert, f_weather = features(dates, p), features(dates, p, w)
     return {
         "naive": np.array([naive_forecast(dates, p, t) for t in targets]),
-        "expert": np.array([ols_forecast(f_expert, p, t) for t in targets]),
-        "expert_weather": np.array([ols_forecast(f_weather, p, t) for t in targets]),
+        "expert": np.array([ols_forecast(f_expert, p, t, window) for t in targets]),
+        "expert_weather": np.array([ols_forecast(f_weather, p, t, window) for t in targets]),
     }
 
 
-def forecast_periods(pw: pd.DataFrame) -> pd.DataFrame:
-    """One row per period of every evaluation day: the price columns and each model's forecast."""
+def forecast_periods(
+    pw: pd.DataFrame, window: int = WINDOW_DAYS, first_index: int | None = None
+) -> pd.DataFrame:
+    """One row per period of every evaluation day, from day ``first_index`` (by default the first
+    the window can forecast): the price columns and each model's forecast."""
     dates, p, w, slots = slot_arrays(pw)
-    targets = range(FIRST_EVAL, len(dates))
-    fc = forecast_slots(dates, p, w, targets)
-    first = dates[FIRST_EVAL]
+    first_index = first_eval(window) if first_index is None else first_index
+    targets = range(first_index, len(dates))
+    fc = forecast_slots(dates, p, w, targets, window)
+    first = dates[first_index]
     out = pw.loc[pw["delivery_date"] >= first, PRICE_COLUMNS].reset_index(drop=True)
     for m in MODELS:
         out[m] = np.concatenate([fc[m][i][slots[t]] for i, t in enumerate(targets)])
@@ -252,11 +315,12 @@ def dm_test(loss_a, loss_b, lag: int) -> dict:
 
 
 def dm_tests(fc: pd.DataFrame) -> pd.DataFrame:
-    """Expert against naive and expert_weather against expert, on daily 15-minute MAE."""
+    """Expert against naive and expert_weather against expert, on daily 15-minute MAE, at each
+    Newey-West lag in DM_LAGS."""
     rows = []
     for a, b in (("expert", "naive"), ("expert_weather", "expert")):
         la, lb = daily_mae(fc, a), daily_mae(fc, b)
-        rows.append({"model_a": a, "model_b": b} | dm_test(la, lb, DM_LAG))
+        rows += [{"model_a": a, "model_b": b} | dm_test(la, lb, lag) for lag in DM_LAGS]
     return pd.DataFrame(rows)
 
 
@@ -317,7 +381,7 @@ def check_perfect_bound(daily: pd.DataFrame) -> None:
         )
 
 
-def summarise(daily: pd.DataFrame) -> pd.DataFrame:
+def summarise(daily: pd.DataFrame, models=MODELS) -> pd.DataFrame:
     """Per duration and model: totals at both resolutions, net capture of perfect foresight at
     the same resolution, and the 15-minute uplift and its share of the perfect-foresight uplift.
     A share is NaN when its perfect-foresight total is zero (within 1e-6 EUR/MW)."""
@@ -333,7 +397,7 @@ def summarise(daily: pd.DataFrame) -> pd.DataFrame:
     for hours in battery.DURATIONS_H:
         perf = tot.loc[(hours, "perfect")]
         perf_up = perf.loc["15min", "net_eur_per_mw"] - perf.loc["hourly", "net_eur_per_mw"]
-        for model in ("perfect", *MODELS):
+        for model in ("perfect", *models):
             t = tot.loc[(hours, model)]
             row = {"duration_h": hours, "model": model, "days": days}
             for label, col in (
@@ -355,6 +419,43 @@ def summarise(daily: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def window_sensitivity(pw: pd.DataFrame, hourly: dict) -> tuple[pd.DataFrame, list[date]]:
+    """The expert models fitted on each window in SENSITIVITY_WINDOWS, all evaluated on the days
+    the longest window can forecast, against perfect foresight on the same days. Per duration,
+    model and window: the 15-minute MAE, the net capture of perfect foresight at both resolutions
+    and the 15-minute uplift in EUR/MW a day and as a share of the perfect-foresight uplift.
+    Also returns the evaluation dates."""
+    first = first_eval(max(SENSITIVITY_WINDOWS))
+    fcs = {win: forecast_periods(pw, win, first) for win in SENSITIVITY_WINDOWS}
+    keys = {(m, win): f"{m} {win}d" for win in SENSITIVITY_WINDOWS for m in SENSITIVITY_MODELS}
+    base = fcs[SENSITIVITY_WINDOWS[0]]  # every window's frame has the same rows
+    rows = []
+    for day, g in base.groupby("delivery_date", sort=True):
+        plans = {k: fcs[win].loc[g.index, m].to_numpy() for (m, win), k in keys.items()}
+        rows += day_values(day, g["price_es"].to_numpy(), hourly[day], plans)
+    daily = pd.DataFrame(rows)
+    check_perfect_bound(daily)
+    s = summarise(daily, list(keys.values())).set_index(["duration_h", "model"])
+    out = []
+    for hours in battery.DURATIONS_H:
+        for (m, win), k in keys.items():
+            r, fc = s.loc[(hours, k)], fcs[win]
+            out.append(
+                {
+                    "duration_h": hours,
+                    "model": m,
+                    "window_days": win,
+                    "days": int(r["days"]),
+                    "mae_15min": (fc[m] - fc["price_es"]).abs().mean(),
+                    "net_capture_15min_pct": r["net_capture_15min_pct"],
+                    "net_capture_hourly_pct": r["net_capture_hourly_pct"],
+                    "net_uplift_eur_per_mw_day": r["net_uplift_eur_per_mw_day"],
+                    "net_uplift_capture_pct": r["net_uplift_capture_pct"],
+                }
+            )
+    return pd.DataFrame(out), sorted(base["delivery_date"].unique())
+
+
 # ---------------------------------------------------------------- run
 
 
@@ -362,7 +463,8 @@ def load_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read and check the inputs: the prices with weather columns (sorted by date and period)
     and the hourly prices. Raises BuildError if a file or column is missing, the weather rows
     are not the price rows, an hourly price is not the mean of its quarters, the days are not
-    consecutive or there are too few days for one evaluation day."""
+    consecutive, there are too few days for one evaluation day of the longest sensitivity
+    window, or a day falls outside the years of the holiday list."""
     ds = data_dir / "dataset"
     paths = {
         "q": ds / "prices_15min.parquet",
@@ -404,10 +506,17 @@ def load_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     dates = sorted(q["delivery_date"].unique())
     if any(b - a != timedelta(days=1) for a, b in zip(dates, dates[1:], strict=False)):
         raise BuildError("the delivery days are not consecutive")
-    if len(dates) <= FIRST_EVAL:
+    need = first_eval(max(SENSITIVITY_WINDOWS)) + 1
+    if len(dates) < need:
         raise BuildError(
-            f"{len(dates)} day(s) of prices; one evaluation day needs at least {FIRST_EVAL + 1}"
-            f" ({WINDOW_DAYS} training days, each with lags back {max(LAGS)} days)"
+            f"{len(dates)} day(s) of prices; one evaluation day needs at least {need}"
+            f" ({max(SENSITIVITY_WINDOWS)} training days for the longest window, each with lags"
+            f" back {max(LAGS)} days)"
+        )
+    if dates[0].year < HOLIDAY_YEARS[0] or dates[-1].year > HOLIDAY_YEARS[1]:
+        raise BuildError(
+            f"the days run from {dates[0]} to {dates[-1]}, but the holiday list covers"
+            f" {HOLIDAY_YEARS[0]}-{HOLIDAY_YEARS[1]} only; add the BOE list for the missing years"
         )
     return pw, h
 
@@ -431,6 +540,7 @@ def run(data_dir: Path) -> dict:
     solve_seconds = time.perf_counter() - solve_started
     check_perfect_bound(daily)
     summary = summarise(daily)
+    sensitivity, sens_dates = window_sensitivity(pw, hourly)
 
     eval_dates = sorted(fc["delivery_date"].unique())
     status = _git("status", "--porcelain")
@@ -441,12 +551,23 @@ def run(data_dir: Path) -> dict:
         " repeated hour is averaged; forecasts are mapped back to the real periods",
         "window_days": WINDOW_DAYS,
         "models": {
-            "naive": "same slot on D-7 for Monday, Saturday and Sunday, on D-1 otherwise",
+            "naive": "on a holiday, same slot on the most recent Sunday before D; otherwise"
+            " same slot on D-7 for Monday, Saturday and Sunday, on D-1 for the other weekdays",
             "expert": list(EXPERT_FEATURES),
             "expert_weather": list(EXPERT_FEATURES + WEATHER_FEATURES),
         },
         "estimation": "numpy.linalg.lstsq per slot, refitted for every day",
-        "holidays": "not modelled",
+        "holidays": {
+            "rule": "treated as a Sunday: the Sunday dummy is 1 and the Monday and Saturday"
+            " dummies 0; the naive forecast copies the most recent Sunday before D",
+            "selection": "national holidays held in every autonomous community and in Ceuta and"
+            " Melilla",
+            "dates": [str(d) for d in HOLIDAYS],
+            "sources": [
+                "https://www.boe.es/diario_boe/txt.php?id=BOE-A-2024-21316",
+                "https://www.boe.es/diario_boe/txt.php?id=BOE-A-2025-21667",
+            ],
+        },
         "hourly_forecast": "mean of each hour's four quarter-hour forecasts",
         "evaluation": {
             "start": str(eval_dates[0]),
@@ -459,7 +580,17 @@ def run(data_dir: Path) -> dict:
             "loss": "daily mean absolute error at 15 minutes",
             "variance": "Newey-West, Bartlett weights",
             "lag_days": DM_LAG,
+            "sensitivity_lags_days": list(DM_LAGS),
             "p_value": "two-sided, normal distribution",
+        },
+        "window_sensitivity": {
+            "windows_days": list(SENSITIVITY_WINDOWS),
+            "models": list(SENSITIVITY_MODELS),
+            "start": str(sens_dates[0]),
+            "end": str(sens_dates[-1]),
+            "days": len(sens_dates),
+            "first_day_rule": f"day {first_eval(max(SENSITIVITY_WINDOWS)) + 1} of the dataset,"
+            " the first the longest window can forecast; perfect foresight on the same days",
         },
         "battery": {
             "spec": SPEC.name,
@@ -485,6 +616,7 @@ def run(data_dir: Path) -> dict:
             out / "forecast_dm_tests.csv": lambda t: dm.to_csv(t, index=False),
             out / "forecast_value_daily.parquet": lambda t: daily.to_parquet(t, index=False),
             out / "forecast_value_summary.csv": lambda t: summary.to_csv(t, index=False),
+            out / "forecast_window_sensitivity.csv": lambda t: sensitivity.to_csv(t, index=False),
             out / "forecast_meta.json": lambda t: t.write_text(
                 json.dumps(meta, indent=2) + "\n", encoding="utf-8"
             ),
