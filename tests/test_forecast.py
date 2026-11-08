@@ -290,8 +290,12 @@ def test_newey_west_lag_0_is_the_plain_variance():
 # ---------------------------------------------------------------- 8: inputs and writing
 
 
+# The three evaluation days of write_data_dir are Friday 5, Saturday 6 and Sunday 7 December.
+START = date(2025, 10, 3)
+
+
 def write_data_dir(root: Path, ndays: int = forecast.FIRST_EVAL + 3) -> None:
-    pw = frame(date(2025, 10, 1), ndays, seed=7)
+    pw = frame(START, ndays, seed=7)
     q = pw[["delivery_start_utc", "delivery_date", "period", "price_es", "price_pt"]].assign(
         source_version=1
     )
@@ -312,17 +316,34 @@ def test_run_writes_every_output(tmp_path):
     out = tmp_path / "results" / "forecast"
     assert set(files_in(out)) == OUTPUTS
     meta = json.loads((out / "forecast_meta.json").read_text(encoding="utf-8"))
-    assert meta["evaluation"]["start"] == str(date(2025, 10, 1) + timedelta(days=63))
+    assert meta["evaluation"]["start"] == str(START + timedelta(days=63))
     assert meta["evaluation"]["days"] == 3
     fc = pd.read_parquet(out / "forecasts_15min.parquet")
     assert len(fc) == 3 * 96 and set(MODELS) <= set(fc.columns)
+    # Each day's naive column is the input price of D-1 on Friday and of D-7 at the weekend.
+    pw = pd.read_parquet(tmp_path / "dataset" / "prices_weather_15min.parquet")
+    for day, lag in ((date(2025, 12, 5), 1), (date(2025, 12, 6), 7), (date(2025, 12, 7), 7)):
+        got = fc.loc[fc["delivery_date"] == day, "naive"].to_numpy()
+        assert np.array_equal(got, day_prices(pw, day - timedelta(days=lag))), day
     s = pd.read_csv(out / "forecast_value_summary.csv")
     assert len(s) == len(battery.DURATIONS_H) * 4
     perfect = s[s["model"] == "perfect"]
     assert np.allclose(perfect[["net_capture_15min_pct", "net_capture_hourly_pct"]], 100)
+    assert np.allclose(perfect["net_uplift_capture_pct"], 100)
     assert (s["net_capture_15min_pct"] <= 100 + 1e-6).all()
     daily = pd.read_parquet(out / "forecast_value_daily.parquet")
     assert len(daily) == 3 * len(battery.DURATIONS_H) * 4 * 2
+    # The uplift columns, recomputed from the daily values.
+    net = daily.pivot_table(
+        index=["duration_h", "model"], columns="resolution", values="net_eur_per_mw", aggfunc="sum"
+    )
+    up = net["15min"] - net["hourly"]
+    for hours in battery.DURATIONS_H:
+        row = s[(s["duration_h"] == hours) & (s["model"] == "expert")].iloc[0]
+        u = up[(hours, "expert")]
+        assert row["net_uplift_keur_per_mw"] == pytest.approx(u / 1000)
+        assert row["net_uplift_eur_per_mw_day"] == pytest.approx(u / 3)
+        assert row["net_uplift_capture_pct"] == pytest.approx(100 * u / up[(hours, "perfect")])
 
 
 @pytest.mark.parametrize(
@@ -334,6 +355,15 @@ def test_a_missing_input_stops_before_anything_is_written(tmp_path, capsys, miss
     (tmp_path / "dataset" / missing).unlink()
     assert cli.main(["forecast", "--data-dir", str(tmp_path)]) == 1
     assert missing in capsys.readouterr().err
+    assert not (tmp_path / "results").exists()
+
+
+def test_a_missing_price_column_in_the_weather_file_stops_the_run(tmp_path, capsys):
+    write_data_dir(tmp_path)
+    path = tmp_path / "dataset" / "prices_weather_15min.parquet"
+    pd.read_parquet(path).drop(columns="delivery_date").to_parquet(path, index=False)
+    assert cli.main(["forecast", "--data-dir", str(tmp_path)]) == 1
+    assert "has no column delivery_date" in capsys.readouterr().err
     assert not (tmp_path / "results").exists()
 
 

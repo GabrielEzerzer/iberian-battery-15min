@@ -378,7 +378,11 @@ def load_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         )
     q, h, pw = (pd.read_parquet(p) for p in paths.values())
     wx_cols = [f"{prefix}_{loc}" for prefix, _ in VARIABLES.values() for loc in LOCATIONS]
-    for name, df, cols in (("q", q, PRICE_COLUMNS), ("h", h, PRICE_COLUMNS), ("pw", pw, wx_cols)):
+    for name, df, cols in (
+        ("q", q, PRICE_COLUMNS),
+        ("h", h, PRICE_COLUMNS),
+        ("pw", pw, PRICE_COLUMNS + wx_cols),
+    ):
         absent = [c for c in cols if c not in df.columns]
         if absent:
             raise BuildError(f"{paths[name]} has no column {', '.join(absent)}")
