@@ -522,7 +522,8 @@ def test_bootstrap_blocks_are_contiguous_and_wrap_around():
     for start, length in ((0, block), (block, n - block)):
         b = idx[:, start : start + length]
         assert (np.diff(b, axis=1) % n == 1).all()
-    assert ((idx[:, :-1] == n - 1) & (idx[:, 1:] == 0)).any()  # some block wraps
+    first = idx[:, :block]  # some first block runs from day 9 on to day 0
+    assert ((first[:, :-1] == n - 1) & (first[:, 1:] == 0)).any()
 
 
 @pytest.mark.parametrize("n", [1, 6, 7, 10, 404])
