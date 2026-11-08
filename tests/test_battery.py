@@ -673,3 +673,24 @@ def test_price_agreement_on_a_hand_computed_case():
     assert a["mean_abs_pt_minus_es_eur_per_mwh"] == pytest.approx((4 + 8) / 8)
     # Spreads: Spain 30 and 0, Portugal 30 and 12.
     assert a["mean_within_hour_spread_eur_per_mwh"] == pytest.approx({"es": 15.0, "pt": 21.0})
+
+
+def test_portugal_intervals_are_the_bootstrap_intervals_of_each_market():
+    # 30 days with different daily uplifts in the two markets, so the intervals are wide and
+    # depend on which days each resample holds.
+    rng = np.random.default_rng(8)
+    n = 30
+    es, pt = (
+        pf_daily(100 + rng.normal(10, 5, n), np.full(n, 100.0)),
+        pf_daily(100 + rng.normal(8, 9, n), np.full(n, 100.0)),
+    )
+    t = portugal(es, pt).set_index(["duration_h", "market"])
+    idx = bootstrap_days(n)
+    for hours in DURATIONS_H:
+        for market, daily in (("es", es), ("pt", pt)):
+            stats = uplift_statistics(daily, hours, "main", idx)
+            for name in UNCERTAINTY_STATS:
+                lo, hi = interval(stats[name])
+                assert lo < hi
+                assert t.loc[(hours, market), f"{name}_ci_low"] == lo
+                assert t.loc[(hours, market), f"{name}_ci_high"] == hi
