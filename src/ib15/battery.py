@@ -64,6 +64,13 @@ SENSITIVITY_SPECS = tuple(
 )
 SOLVED_SPECS = SPECS + tuple(s for s in SENSITIVITY_SPECS if s not in SPECS)
 
+# Uncertainty: a circular moving-block bootstrap over days, set in advance, not tuned.
+BOOT_BLOCK_DAYS = 7
+BOOT_RESAMPLES = 10_000
+BOOT_SEED = 20251001
+BOOT_PERCENTILES = (2.5, 97.5)  # a 95% percentile interval
+UNCERTAINTY_STATS = ("net_uplift_eur_per_mw_day", "net_uplift_pct")
+
 
 class SolveError(Exception):
     pass
@@ -226,6 +233,89 @@ def cost_sensitivity(daily: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def bootstrap_days(
+    n: int, block: int = BOOT_BLOCK_DAYS, resamples: int = BOOT_RESAMPLES, seed: int = BOOT_SEED
+) -> np.ndarray:
+    """Circular moving-block bootstrap of ``n`` days: shape (resamples, n), each row the day
+    indices (0..n-1) of one resample. A row joins blocks of ``block`` consecutive days, each
+    starting at a uniformly drawn day and wrapping from the last day to the first, cut to ``n``
+    days. Draw it once and resample every statistic on the same rows, so comparisons stay
+    paired."""
+    if n < 1:
+        raise ValueError("no days to resample")
+    rng = np.random.default_rng(seed)
+    starts = rng.integers(0, n, size=(resamples, -(-n // block)))
+    return ((starts[:, :, None] + np.arange(block)) % n).reshape(resamples, -1)[:, :n]
+
+
+def percent(x, ref) -> np.ndarray:
+    """100 * x / ref elementwise, NaN where ref is zero (within 1e-6 EUR/MW), as the summaries
+    compute their percentages."""
+    x, ref = np.asarray(x, dtype=float), np.asarray(ref, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(np.abs(ref) <= 1e-6, np.nan, 100 * x / ref)
+
+
+def interval(stats) -> tuple[float, float]:
+    """The BOOT_PERCENTILES of a statistic over the resamples; NaN if it is undefined on any."""
+    stats = np.asarray(stats, dtype=float)
+    if np.isnan(stats).any():
+        return math.nan, math.nan
+    lo, hi = np.percentile(stats, BOOT_PERCENTILES)
+    return float(lo), float(hi)
+
+
+def bootstrap_meta() -> dict:
+    return {
+        "method": "circular moving-block bootstrap over days (numpy.random.default_rng)",
+        "block_days": BOOT_BLOCK_DAYS,
+        "resamples": BOOT_RESAMPLES,
+        "seed": BOOT_SEED,
+        "interval": f"95% percentile interval, percentiles {list(BOOT_PERCENTILES)}",
+        "statistic": "recomputed on each resample as the point estimate is: a ratio of sums or a"
+        " mean over the resampled days; every series is resampled on the same days",
+        "undefined": "both bounds are empty when the statistic's denominator is zero (within"
+        " 1e-6 EUR/MW) on any resample",
+    }
+
+
+def uplift_statistics(daily: pd.DataFrame, hours: int, spec: str, idx) -> dict[str, np.ndarray]:
+    """The 15-minute net uplift of one (duration_h, spec) on each resample of days (the rows of
+    ``idx``, indices into the sorted days), as ``_compare`` computes it: in EUR/MW a day (a mean
+    over the days) and in percent of the hourly total (a ratio of sums)."""
+    g = daily[(daily["duration_h"] == hours) & (daily["spec"] == spec)]
+    w = g.pivot(index="delivery_date", columns="resolution", values="net_eur_per_mw").sort_index()
+    v15, vh = w["15min"].to_numpy()[idx], w["hourly"].to_numpy()[idx]
+    return {
+        "net_uplift_eur_per_mw_day": (v15 - vh).mean(axis=1),
+        "net_uplift_pct": percent((v15 - vh).sum(axis=1), vh.sum(axis=1)),
+    }
+
+
+def uncertainty(daily: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
+    """Per (duration_h, spec) of the summary and statistic in UNCERTAINTY_STATS: the summary's
+    value and its bootstrap interval, every row resampled on the same days."""
+    idx = bootstrap_days(daily["delivery_date"].nunique())
+    s = summary.set_index(["duration_h", "spec"])
+    rows = []
+    for hours, spec in s.index:
+        stats = uplift_statistics(daily, hours, spec, idx)
+        for name in UNCERTAINTY_STATS:
+            lo, hi = interval(stats[name])
+            rows.append(
+                {
+                    "duration_h": hours,
+                    "spec": spec,
+                    "statistic": name,
+                    "days": s.loc[(hours, spec), "days"],
+                    "estimate": s.loc[(hours, spec), name],
+                    "ci_low": lo,
+                    "ci_high": hi,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def _write_all(files: dict[Path, Callable[[Path], object]]) -> None:
     """Replace a set of files all together, or leave the previous set as it was.
 
@@ -295,6 +385,7 @@ def perfect_foresight(data_dir: Path) -> dict:
     daily = daily_values(q, h)
     summary = summarise(daily)
     sensitivity = cost_sensitivity(daily)
+    unc = uncertainty(daily, summary)
     status = _git("status", "--porcelain")
     meta = {
         "power_mw": POWER_MW,
@@ -326,6 +417,7 @@ def perfect_foresight(data_dir: Path) -> dict:
             "end": str(max(daily["delivery_date"])),
         },
         "days": int(daily["delivery_date"].nunique()),
+        "uncertainty": bootstrap_meta() | {"statistics": list(UNCERTAINTY_STATS)},
         "solve_seconds": round(time.perf_counter() - started, 1),
         "git_commit": _git("rev-parse", "HEAD"),
         "git_dirty": None if status is None else bool(status),
@@ -339,6 +431,7 @@ def perfect_foresight(data_dir: Path) -> dict:
             out / "perfect_foresight_cost_sensitivity.csv": lambda t: sensitivity.to_csv(
                 t, index=False
             ),
+            out / "perfect_foresight_uncertainty.csv": lambda t: unc.to_csv(t, index=False),
             out / "perfect_foresight_meta.json": lambda t: t.write_text(
                 json.dumps(meta, indent=2) + "\n", encoding="utf-8"
             ),

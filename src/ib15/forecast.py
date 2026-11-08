@@ -33,7 +33,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from scipy.stats import kendalltau, norm, spearmanr
 
 from ib15 import battery
 from ib15.dataset import BuildError, _git
@@ -117,6 +117,7 @@ DM_LAGS = (DM_LAG, 14, 28)  # the lags reported in forecast_dm_tests.csv
 SPEC = next(s for s in battery.SPECS if s.name == "main")
 BOUND_TOL = 1e-6  # EUR/MW; perfect foresight may not fall further below a forecast's value
 PRICE_COLUMNS = ["delivery_start_utc", "delivery_date", "period", "price_es"]
+UPLIFT_DIFFS = (("expert", "naive"), ("expert_weather", "expert"))  # paired uplift differences
 
 
 # ---------------------------------------------------------------- slots
@@ -278,6 +279,7 @@ def errors(fc: pd.DataFrame) -> pd.DataFrame:
                 "mae_hourly": eh.abs().mean(),
                 "rmse_hourly": math.sqrt((eh**2).mean()),
                 "mae_within_hour_deviation": dev.abs().mean(),
+                "mean_daily_kendall_tau": daily_tau(fc, m).mean(),
             }
         )
     return pd.DataFrame(rows)
@@ -285,6 +287,48 @@ def errors(fc: pd.DataFrame) -> pd.DataFrame:
 
 def daily_mae(fc: pd.DataFrame, model: str) -> pd.Series:
     return (fc[model] - fc["price_es"]).abs().groupby(fc["delivery_date"]).mean()
+
+
+def daily_tau(fc: pd.DataFrame, model: str) -> pd.Series:
+    """Per day, Kendall's tau-b between the forecast and actual prices of the day's periods."""
+    return pd.Series(
+        {
+            day: kendalltau(g[model], g["price_es"]).statistic
+            for day, g in fc.groupby("delivery_date", sort=True)
+        }
+    )
+
+
+def regret_drivers(fc: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
+    """Per duration and model, and pooled over the models: the Spearman correlation across days
+    between the daily 15-minute regret (perfect-foresight net minus the model's net, EUR/MW) and
+    the day's 15-minute MAE, and between the regret and the day's Kendall tau."""
+    q = daily[daily["resolution"] == "15min"].pivot(
+        index="delivery_date", columns=["duration_h", "model"], values="net_eur_per_mw"
+    )
+    mae = {m: daily_mae(fc, m) for m in MODELS}
+    tau = {m: daily_tau(fc, m) for m in MODELS}
+    rows = []
+    for hours in battery.DURATIONS_H:
+        frames = {
+            m: pd.DataFrame(
+                {"regret": q[(hours, "perfect")] - q[(hours, m)], "mae": mae[m], "tau": tau[m]}
+            )
+            for m in MODELS
+        }
+        for label, models in [(m, [m]) for m in MODELS] + [("pooled", list(MODELS))]:
+            f = pd.concat([frames[m] for m in models])
+            rows.append(
+                {
+                    "duration_h": hours,
+                    "model": label,
+                    "days": len(frames[models[0]]),
+                    "observations": len(f),
+                    "spearman_regret_mae": spearmanr(f["regret"], f["mae"]).statistic,
+                    "spearman_regret_tau": spearmanr(f["regret"], f["tau"]).statistic,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def newey_west_variance(d, lag: int) -> float:
@@ -419,6 +463,62 @@ def summarise(daily: pd.DataFrame, models=MODELS) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def resampled_statistics(daily: pd.DataFrame, idx) -> dict[tuple[int, str, str], np.ndarray]:
+    """Per (duration_h, model, statistic), the statistic on each resample of days (the rows of
+    ``idx``, indices into the sorted days), computed as ``summarise`` computes it: the net
+    capture of perfect foresight at each resolution and the uplift's share of the
+    perfect-foresight uplift as ratios of sums, the uplift in EUR/MW a day as a mean over the
+    days. Also the difference in uplift a day of each pair in UPLIFT_DIFFS, as model "a minus b"."""
+    cols = ["duration_h", "model", "resolution"]
+    w = daily.pivot(index="delivery_date", columns=cols, values="net_eur_per_mw").sort_index()
+    days = idx.shape[1]
+    tot = {col: w[col].to_numpy()[idx].sum(axis=1) for col in w.columns}
+    out = {}
+    for hours in battery.DURATIONS_H:
+
+        def up(m, hours=hours):
+            return tot[(hours, m, "15min")] - tot[(hours, m, "hourly")]
+
+        for m in ("perfect", *MODELS):
+            for res in ("15min", "hourly"):
+                out[(hours, m, f"net_capture_{res}_pct")] = battery.percent(
+                    tot[(hours, m, res)], tot[(hours, "perfect", res)]
+                )
+            out[(hours, m, "net_uplift_eur_per_mw_day")] = up(m) / days
+            out[(hours, m, "net_uplift_capture_pct")] = battery.percent(up(m), up("perfect"))
+        for a, b in UPLIFT_DIFFS:
+            out[(hours, f"{a} minus {b}", "net_uplift_eur_per_mw_day")] = (up(a) - up(b)) / days
+    return out
+
+
+def uncertainty(daily: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
+    """Per duration, model and statistic of ``resampled_statistics``: the value in ``summary``
+    (for a difference, the difference of its values) and its bootstrap interval. Every model,
+    resolution and duration is resampled on the same days."""
+    idx = battery.bootstrap_days(daily["delivery_date"].nunique())
+    s = summary.set_index(["duration_h", "model"])
+    rows = []
+    for (hours, model, stat), values in resampled_statistics(daily, idx).items():
+        if (hours, model) in s.index:
+            estimate = s.loc[(hours, model), stat]
+        else:
+            a, b = model.split(" minus ")
+            estimate = s.loc[(hours, a), stat] - s.loc[(hours, b), stat]
+        lo, hi = battery.interval(values)
+        rows.append(
+            {
+                "duration_h": hours,
+                "model": model,
+                "statistic": stat,
+                "days": idx.shape[1],
+                "estimate": estimate,
+                "ci_low": lo,
+                "ci_high": hi,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def window_sensitivity(pw: pd.DataFrame, hourly: dict) -> tuple[pd.DataFrame, list[date]]:
     """The expert models fitted on each window in SENSITIVITY_WINDOWS, all evaluated on the days
     the longest window can forecast, against perfect foresight on the same days. Per duration,
@@ -540,6 +640,8 @@ def run(data_dir: Path) -> dict:
     solve_seconds = time.perf_counter() - solve_started
     check_perfect_bound(daily)
     summary = summarise(daily)
+    unc = uncertainty(daily, summary)
+    drivers = regret_drivers(fc, daily)
     sensitivity, sens_dates = window_sensitivity(pw, hourly)
 
     eval_dates = sorted(fc["delivery_date"].unique())
@@ -583,6 +685,18 @@ def run(data_dir: Path) -> dict:
             "sensitivity_lags_days": list(DM_LAGS),
             "p_value": "two-sided, normal distribution",
         },
+        "uncertainty": battery.bootstrap_meta()
+        | {
+            "days": "the evaluation days",
+            "differences": [f"{a} minus {b}" for a, b in UPLIFT_DIFFS],
+        },
+        "kendall_tau": "per day, scipy.stats.kendalltau (tau-b, which corrects for ties) between"
+        " each model's forecast and the actual price over the day's real periods; the errors"
+        " file gives its mean over the evaluation days",
+        "regret_drivers": "per duration and model, scipy.stats.spearmanr across days between the"
+        " daily 15-minute regret (perfect-foresight net minus the model's net, EUR/MW) and the"
+        " day's 15-minute MAE, and between the regret and the day's Kendall tau; the pooled row"
+        " stacks the three models' days",
         "window_sensitivity": {
             "windows_days": list(SENSITIVITY_WINDOWS),
             "models": list(SENSITIVITY_MODELS),
@@ -616,6 +730,8 @@ def run(data_dir: Path) -> dict:
             out / "forecast_dm_tests.csv": lambda t: dm.to_csv(t, index=False),
             out / "forecast_value_daily.parquet": lambda t: daily.to_parquet(t, index=False),
             out / "forecast_value_summary.csv": lambda t: summary.to_csv(t, index=False),
+            out / "forecast_uncertainty.csv": lambda t: unc.to_csv(t, index=False),
+            out / "forecast_regret_drivers.csv": lambda t: drivers.to_csv(t, index=False),
             out / "forecast_window_sensitivity.csv": lambda t: sensitivity.to_csv(t, index=False),
             out / "forecast_meta.json": lambda t: t.write_text(
                 json.dumps(meta, indent=2) + "\n", encoding="utf-8"
