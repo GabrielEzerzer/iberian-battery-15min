@@ -642,13 +642,15 @@ def test_the_interval_collapses_when_every_day_is_the_same():
 
 def test_every_model_is_resampled_on_the_same_days():
     # Expert earns naive's values plus 3 EUR/MW of uplift every day, so their paired difference
-    # is 3 on every resample while each model's own uplift varies a lot from day to day.
+    # is 3 on every resample while each model's own uplift varies a lot from day to day. Perfect
+    # foresight earns twice naive's values, so naive's captures and uplift share are 50 on every
+    # resample only if the benchmark is resampled on the same days.
     rng = np.random.default_rng(13)
     n = 60
     v15, vh = random_values(rng, n)
     daily = value_daily(
         {
-            "perfect": (v15 + 100, vh + 50),
+            "perfect": (2 * v15, 2 * vh),
             "naive": (v15, vh),
             "expert": (v15 + 3, vh),
             "expert_weather": random_values(rng, n),
@@ -661,6 +663,9 @@ def test_every_model_is_resampled_on_the_same_days():
     assert diff[["estimate", "ci_low", "ci_high"]].tolist() == pytest.approx([3, 3, 3])
     own = unc.loc[(2, "naive", "net_uplift_eur_per_mw_day")]
     assert own["ci_high"] - own["ci_low"] > 2
+    for stat in ("net_capture_15min_pct", "net_capture_hourly_pct", "net_uplift_capture_pct"):
+        row = unc.loc[(2, "naive", stat)]
+        assert row[["estimate", "ci_low", "ci_high"]].tolist() == pytest.approx([50, 50, 50])
 
 
 def test_kendall_tau_matches_hand_computed_values():
