@@ -259,12 +259,13 @@ def download(
     """Download every location's forecasts for start..end (UTC dates) into raw_dir, one request
     per location and calendar month, saved unchanged.
 
-    Sequential, with ``pause`` seconds between requests. A chunk already saved is skipped once
-    its end is at least two days before today (UTC) and its file is valid with no nulls;
-    otherwise it is fetched again, since a recent chunk's last hours, or a chunk fetched with a
-    future end, may still be null. Every response is validated before it is saved; a bad one is
-    an error and nothing is written. A saved chunk replaces the other files for the same
-    location and model whose range lies inside its own; a wider file is kept.
+    Sequential, with ``pause`` seconds between requests. A chunk is skipped once its end is at
+    least two days before today (UTC) and a saved file for the same location and model covers
+    its dates and is valid with no nulls; otherwise it is fetched again, since a recent chunk's
+    last hours, or a chunk fetched with a future end, may still be null. Every response is
+    validated before it is saved; a bad one is an error and nothing is written. A saved chunk
+    replaces the other files for the same location and model whose range lies inside its own;
+    a wider file is kept.
     """
     fetch = fetch or http_get
     today = today or datetime.now(UTC).date()
@@ -274,7 +275,7 @@ def download(
     for loc, (lat, lon) in LOCATIONS.items():
         for cs, ce in month_chunks(start, end):
             name = file_name(loc, cs, ce)
-            if ce <= today - SETTLED_AFTER and _complete(raw_dir / name, lat, lon, cs, ce):
+            if ce <= today - SETTLED_AFTER and _covered(raw_dir, loc, lat, lon, cs, ce):
                 result.skipped.append(name)
                 continue
             if requests:
@@ -310,6 +311,28 @@ def download(
             result.saved.append(name)
             print(f"{name} saved")
     return result
+
+
+def _covered(raw_dir: Path, loc: str, lat: float, lon: float, start: date, end: date) -> bool:
+    """Whether a saved file for ``loc`` and the model covers start..end and is complete for the
+    range in its own name."""
+    for p in raw_dir.iterdir():
+        m = FILE_RE.match(p.name)
+        if not (
+            m
+            and m["loc"] == loc
+            and m["model"] == MODEL
+            and m["start"] <= f"{start}"
+            and m["end"] >= f"{end}"
+        ):
+            continue
+        try:
+            own = date.fromisoformat(m["start"]), date.fromisoformat(m["end"])
+        except ValueError:
+            continue
+        if _complete(p, lat, lon, *own):
+            return True
+    return False
 
 
 def _complete(path: Path, lat: float, lon: float, start: date, end: date) -> bool:
