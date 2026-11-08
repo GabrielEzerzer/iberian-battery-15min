@@ -51,6 +51,7 @@ SPECS = (
     Spec("no_cost", 0.0, None),
     Spec("cap2", 0.0, 2.0),
 )
+MAIN_SPEC = SPECS[0]  # the only spec also solved on the Portuguese price
 
 # Wear costs (EUR per MWh discharged) for the no-cap sensitivity. A cost that an existing no-cap
 # spec already has reuses that spec's solves, so 0 and 20 are the no_cost and main rows.
@@ -144,17 +145,20 @@ def solve_day(prices, dt: float, energy_mwh: float, spec: Spec) -> Dispatch:
     )
 
 
-def daily_values(q: pd.DataFrame, h: pd.DataFrame) -> pd.DataFrame:
-    """One row per (delivery_date, duration_h, spec, resolution) from the 15-minute and hourly
-    price tables. Raises BuildError if the hourly prices are not the means of the quarters."""
+def daily_values(
+    q: pd.DataFrame, h: pd.DataFrame, price: str = "price_es", specs=SOLVED_SPECS
+) -> pd.DataFrame:
+    """One row per (delivery_date, duration_h, spec, resolution) from the ``price`` column of the
+    15-minute and hourly price tables, for each spec in ``specs``. Raises BuildError if the
+    hourly prices are not the means of the quarters."""
     q = q.sort_values(["delivery_date", "period"])
     h = h.sort_values(["delivery_date", "period"])
-    hourly = {d: g["price_es"].to_numpy() for d, g in h.groupby("delivery_date")}
+    hourly = {d: g[price].to_numpy() for d, g in h.groupby("delivery_date")}
     if set(hourly) != set(q["delivery_date"]):
         raise BuildError("the 15-minute and hourly price files cover different days")
     rows = []
     for day, g in q.groupby("delivery_date"):
-        pq = g["price_es"].to_numpy()
+        pq = g[price].to_numpy()
         ph = hourly.get(day)
         if ph is None or len(pq) != 4 * len(ph):
             raise BuildError(f"{day}: hourly prices do not match the 15-minute periods")
@@ -162,7 +166,7 @@ def daily_values(q: pd.DataFrame, h: pd.DataFrame) -> pd.DataFrame:
             raise BuildError(f"{day}: an hourly price is not the mean of its four quarter-hours")
         for hours in DURATIONS_H:
             energy = POWER_MW * hours
-            for spec in SOLVED_SPECS:
+            for spec in specs:
                 for resolution, prices, dt in (("15min", pq, DT_15MIN), ("hourly", ph, DT_HOURLY)):
                     r = solve_day(prices, dt, energy, spec)
                     rows.append(
@@ -316,6 +320,42 @@ def uncertainty(daily: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def portugal(daily: pd.DataFrame, daily_pt: pd.DataFrame) -> pd.DataFrame:
+    """One row per (duration_h, market) for the main spec: ``_compare`` on the Spanish daily
+    values (``daily``, so the es rows are the summary's main rows) and on the Portuguese ones
+    (``daily_pt``), with the bootstrap interval of each UNCERTAINTY_STATS statistic. Both markets
+    are resampled on the same days."""
+    idx = bootstrap_days(daily["delivery_date"].nunique())
+    rows = []
+    for hours in DURATIONS_H:
+        for market, frame in (("es", daily), ("pt", daily_pt)):
+            row = {"duration_h": hours, "market": market} | _compare(frame, hours, MAIN_SPEC)
+            stats = uplift_statistics(frame, hours, MAIN_SPEC.name, idx)
+            for name in UNCERTAINTY_STATS:
+                row[f"{name}_ci_low"], row[f"{name}_ci_high"] = interval(stats[name])
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def price_agreement(q: pd.DataFrame) -> dict:
+    """How close the Portuguese 15-minute price is to the Spanish one: the share of quarter-hours
+    where they are equal, the mean absolute difference, and each market's mean within-hour
+    spread (max minus min of an hour's four quarter-hours, averaged over hours)."""
+    q = q.sort_values(["delivery_date", "period"])
+    diff = (q["price_pt"] - q["price_es"]).abs()
+    hours = q.assign(hour=(q["period"] - 1) // 4).groupby(["delivery_date", "hour"])
+    spread = hours[["price_pt", "price_es"]].max() - hours[["price_pt", "price_es"]].min()
+    return {
+        "quarter_hours": len(q),
+        "share_pt_equal_to_es": float((diff <= 1e-9).mean()),
+        "mean_abs_pt_minus_es_eur_per_mwh": float(diff.mean()),
+        "mean_within_hour_spread_eur_per_mwh": {
+            "pt": float(spread["price_pt"].mean()),
+            "es": float(spread["price_es"].mean()),
+        },
+    }
+
+
 def _write_all(files: dict[Path, Callable[[Path], object]]) -> None:
     """Replace a set of files all together, or leave the previous set as it was.
 
@@ -386,6 +426,7 @@ def perfect_foresight(data_dir: Path) -> dict:
     summary = summarise(daily)
     sensitivity = cost_sensitivity(daily)
     unc = uncertainty(daily, summary)
+    pt = portugal(daily, daily_values(q, h, "price_pt", (MAIN_SPEC,)))
     status = _git("status", "--porcelain")
     meta = {
         "power_mw": POWER_MW,
@@ -418,6 +459,8 @@ def perfect_foresight(data_dir: Path) -> dict:
         },
         "days": int(daily["delivery_date"].nunique()),
         "uncertainty": bootstrap_meta() | {"statistics": list(UNCERTAINTY_STATS)},
+        "portugal_spec": MAIN_SPEC.name,
+        "portugal_price_agreement": price_agreement(q),
         "solve_seconds": round(time.perf_counter() - started, 1),
         "git_commit": _git("rev-parse", "HEAD"),
         "git_dirty": None if status is None else bool(status),
@@ -432,6 +475,7 @@ def perfect_foresight(data_dir: Path) -> dict:
                 t, index=False
             ),
             out / "perfect_foresight_uncertainty.csv": lambda t: unc.to_csv(t, index=False),
+            out / "perfect_foresight_portugal.csv": lambda t: pt.to_csv(t, index=False),
             out / "perfect_foresight_meta.json": lambda t: t.write_text(
                 json.dumps(meta, indent=2) + "\n", encoding="utf-8"
             ),

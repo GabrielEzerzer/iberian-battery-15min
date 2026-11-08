@@ -28,6 +28,8 @@ from ib15.battery import (
     cost_sensitivity,
     daily_values,
     interval,
+    portugal,
+    price_agreement,
     solve_day,
     summarise,
     uncertainty,
@@ -203,15 +205,15 @@ def test_solver_failure_raises():
         solve_day(random_day(np.random.default_rng(0)), DT_15MIN, 1.0, impossible)
 
 
-def price_tables(days):
+def price_tables(days, pt_days=None):
     """15-minute and hourly price tables, as the dataset stores them, for a list of price days
-    starting on 2025-10-01."""
+    starting on 2025-10-01. The Portuguese prices are ``pt_days``, or the Spanish ones."""
     rows = []
-    for i, prices in enumerate(days):
+    for i, (prices, pt) in enumerate(zip(days, pt_days or days, strict=True)):
         day = date(2025, 10, 1) + timedelta(days=i)
         start = datetime(2025, 9, 30, 22, tzinfo=UTC) + timedelta(days=i)
-        for k, price in enumerate(prices):
-            rows.append((start + timedelta(minutes=15 * k), day, k + 1, price, price, 1))
+        for k, (price, price_pt) in enumerate(zip(prices, pt, strict=True)):
+            rows.append((start + timedelta(minutes=15 * k), day, k + 1, price, price_pt, 1))
     q = pd.DataFrame(
         rows,
         columns=[
@@ -224,7 +226,7 @@ def price_tables(days):
         ],
     )
     h = q.assign(period=(q["period"] - 1) // 4 + 1).groupby(["delivery_date", "period"])
-    h = h.agg(price_es=("price_es", "mean")).reset_index()
+    h = h.agg(price_es=("price_es", "mean"), price_pt=("price_pt", "mean")).reset_index()
     return q, h
 
 
@@ -296,6 +298,7 @@ RESULT_FILES = [
     "perfect_foresight_cost_sensitivity.csv",
     "perfect_foresight_daily.parquet",
     "perfect_foresight_meta.json",
+    "perfect_foresight_portugal.csv",
     "perfect_foresight_summary.csv",
     "perfect_foresight_uncertainty.csv",
 ]
@@ -605,3 +608,92 @@ def test_the_interval_matches_the_normal_one_for_independent_days():
 
 def test_an_undefined_statistic_has_no_bounds():
     assert all(math.isnan(x) for x in interval([1.0, math.nan, 2.0]))
+
+
+# ---------------------------------------------------------------- Portugal
+
+
+def portugal_table(days, pt_days):
+    q, h = price_tables(days, pt_days)
+    return portugal(daily_values(q, h), daily_values(q, h, "price_pt", (MAIN,)))
+
+
+def test_portugal_rows_equal_the_spanish_ones_when_the_prices_are_equal(tmp_path):
+    data_dir = dataset_dir(tmp_path)
+    assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
+    out = data_dir / "results"
+    pt = pd.read_csv(out / "perfect_foresight_portugal.csv")
+    summary = pd.read_csv(out / "perfect_foresight_summary.csv")
+    unc = pd.read_csv(out / "perfect_foresight_uncertainty.csv")
+    assert list(zip(pt["duration_h"], pt["market"], strict=True)) == [
+        (h, m) for h in DURATIONS_H for m in ("es", "pt")
+    ]
+    es, pt_rows = pt[pt["market"] == "es"], pt[pt["market"] == "pt"]
+    main_rows = summary[summary["spec"] == "main"]
+    shared = [c for c in summary.columns if c != "spec"]
+    # The es rows are the summary's main rows, and the pt rows (same prices) are the same.
+    for rows in (es, pt_rows):
+        assert rows[shared].reset_index(drop=True).equals(main_rows[shared].reset_index(drop=True))
+    # The intervals are the uncertainty file's main intervals, on the same resampled days.
+    for name in UNCERTAINTY_STATS:
+        u = unc[(unc["spec"] == "main") & (unc["statistic"] == name)]
+        for rows in (es, pt_rows):
+            assert list(rows[f"{name}_ci_low"]) == list(u["ci_low"])
+            assert list(rows[f"{name}_ci_high"]) == list(u["ci_high"])
+
+
+def test_portugal_rows_follow_the_portuguese_price():
+    # Spain is flat at 50 within each hour; Portugal alternates 0 and 100 by quarter-hour around
+    # the same hourly mean on the second day. Spain gains nothing from 15 minutes, Portugal does.
+    rng = np.random.default_rng(5)
+    hourly_shape = np.repeat(np.round(rng.uniform(20, 120, 24), 2), 4)
+    flat = np.repeat(50.0, 96)
+    days = [hourly_shape, flat]
+    pt_days = [hourly_shape, flat + np.tile([-50.0, 50.0], 48)]
+    t = portugal_table(days, pt_days).set_index(["duration_h", "market"])
+    for hours in DURATIONS_H:
+        es, pt = t.loc[(hours, "es")], t.loc[(hours, "pt")]
+        assert es["net_uplift_eur_per_mw_day"] == pytest.approx(0, abs=1e-6)
+        assert pt["net_uplift_eur_per_mw_day"] > 1
+        # The hourly prices are the same in both markets, so is the hourly value.
+        assert pt["net_hourly_keur_per_mw"] == pytest.approx(es["net_hourly_keur_per_mw"])
+        # Portugal's 15-minute value is a direct solve of its 15-minute prices.
+        direct = sum(solve_day(p, DT_15MIN, hours * POWER_MW, MAIN).net for p in pt_days)
+        assert pt["net_15min_keur_per_mw"] == pytest.approx(direct / 1000, rel=1e-9)
+
+
+def test_price_agreement_on_a_hand_computed_case():
+    # Two hours. Spain: 10, 20, 30, 40 | 50, 50, 50, 50. Portugal: 10, 20, 30, 40 | 46, 50, 58, 50.
+    es = [10.0, 20.0, 30.0, 40.0, 50.0, 50.0, 50.0, 50.0]
+    pt = [10.0, 20.0, 30.0, 40.0, 46.0, 50.0, 58.0, 50.0]
+    # A second day 100 EUR/MWh higher has the same spreads, so pooling the days by hour of day
+    # (spread 130 in the first hour) would show.
+    up = [[p + 100 for p in day] for day in (es, pt)]
+    q, _ = price_tables([es, up[0]], [pt, up[1]])
+    a = price_agreement(q.iloc[::-1])  # row order does not matter
+    assert a["quarter_hours"] == 16
+    assert a["share_pt_equal_to_es"] == 12 / 16
+    assert a["mean_abs_pt_minus_es_eur_per_mwh"] == pytest.approx(2 * (4 + 8) / 16)
+    # Spreads on each day: Spain 30 and 0, Portugal 30 and 12.
+    assert a["mean_within_hour_spread_eur_per_mwh"] == pytest.approx({"es": 15.0, "pt": 21.0})
+
+
+def test_portugal_intervals_are_the_bootstrap_intervals_of_each_market():
+    # 30 days with different daily uplifts in the two markets, so the intervals are wide and
+    # depend on which days each resample holds.
+    rng = np.random.default_rng(8)
+    n = 30
+    es, pt = (
+        pf_daily(100 + rng.normal(10, 5, n), np.full(n, 100.0)),
+        pf_daily(100 + rng.normal(8, 9, n), np.full(n, 100.0)),
+    )
+    t = portugal(es, pt).set_index(["duration_h", "market"])
+    idx = bootstrap_days(n)
+    for hours in DURATIONS_H:
+        for market, daily in (("es", es), ("pt", pt)):
+            stats = uplift_statistics(daily, hours, "main", idx)
+            for name in UNCERTAINTY_STATS:
+                lo, hi = interval(stats[name])
+                assert lo < hi
+                assert t.loc[(hours, market), f"{name}_ci_low"] == lo
+                assert t.loc[(hours, market), f"{name}_ci_high"] == hi
