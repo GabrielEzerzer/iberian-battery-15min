@@ -20,6 +20,8 @@ OUTPUTS = {
     "forecast_value_daily.parquet",
     "forecast_value_summary.csv",
     "forecast_window_sensitivity.csv",
+    "forecast_uncertainty.csv",
+    "forecast_regret_drivers.csv",
     "forecast_meta.json",
 }
 
@@ -478,6 +480,28 @@ def test_run_writes_every_output(tmp_path):
         assert row["net_uplift_keur_per_mw"] == pytest.approx(u / 1000)
         assert row["net_uplift_eur_per_mw_day"] == pytest.approx(u / days)
         assert row["net_uplift_capture_pct"] == pytest.approx(100 * u / up[(hours, "perfect")])
+    # The uncertainty estimates are the summary values, and the differences their differences.
+    unc = pd.read_csv(out / "forecast_uncertainty.csv")
+    assert (unc["days"] == days).all()
+    assert len(unc) == len(battery.DURATIONS_H) * (4 * 4 + 2)
+    si = s.set_index(["duration_h", "model"])
+    for _, r in unc.iterrows():
+        hours, stat = r["duration_h"], r["statistic"]
+        if " minus " in r["model"]:
+            a, b = r["model"].split(" minus ")
+            want = si.loc[(hours, a), stat] - si.loc[(hours, b), stat]
+        else:
+            want = si.loc[(hours, r["model"]), stat]
+        assert r["estimate"] == want, tuple(r)
+    assert meta["uncertainty"]["seed"] == battery.BOOT_SEED
+    assert "tau-b" in meta["kendall_tau"]
+    err = pd.read_csv(out / "forecast_errors.csv")
+    assert err.columns[-1] == "mean_daily_kendall_tau"
+    assert err["mean_daily_kendall_tau"].between(-1, 1).all()
+    drivers = pd.read_csv(out / "forecast_regret_drivers.csv")
+    assert len(drivers) == len(battery.DURATIONS_H) * 4
+    pooled = drivers[drivers["model"] == "pooled"]
+    assert (pooled["observations"] == 3 * days).all() and (drivers["days"] == days).all()
 
 
 @pytest.mark.parametrize(
@@ -551,3 +575,149 @@ def test_a_failure_while_writing_leaves_the_previous_outputs(tmp_path, monkeypat
     new = files_in(out)
     assert set(new) == set(previous)
     assert all(new[name] != previous[name] for name in previous)
+
+
+# ---------------------------------------------------------------- 9: uncertainty and rank
+
+
+def value_daily(values: dict[str, tuple]) -> pd.DataFrame:
+    """A forecast_value_daily frame: per model, its 15-minute and hourly net values a day, the
+    same at every duration."""
+    n = len(next(iter(values.values()))[0])
+    days = [date(2026, 1, 1) + timedelta(days=i) for i in range(n)]
+    rows = [
+        {
+            "delivery_date": d,
+            "duration_h": hours,
+            "model": m,
+            "resolution": res,
+            "gross_eur_per_mw": v[i],
+            "wear_cost_eur_per_mw": 0.0,
+            "net_eur_per_mw": v[i],
+        }
+        for hours in battery.DURATIONS_H
+        for m, (v15, vh) in values.items()
+        for res, v in (("15min", v15), ("hourly", vh))
+        for i, d in enumerate(days)
+    ]
+    return pd.DataFrame(rows)
+
+
+def random_values(rng, n):
+    vh = rng.uniform(50, 150, n)
+    return vh + rng.uniform(0, 40, n), vh
+
+
+def test_resampled_statistics_on_the_original_days_are_the_summary():
+    rng = np.random.default_rng(12)
+    daily = value_daily({m: random_values(rng, 40) for m in ("perfect", *MODELS)})
+    s = forecast.summarise(daily).set_index(["duration_h", "model"])
+    stats = forecast.resampled_statistics(daily, np.arange(40)[None])
+    assert len(stats) == len(battery.DURATIONS_H) * (4 * 4 + 2)
+    for (hours, model, stat), v in stats.items():
+        if " minus " in model:
+            a, b = model.split(" minus ")
+            want = s.loc[(hours, a), stat] - s.loc[(hours, b), stat]
+        else:
+            want = s.loc[(hours, model), stat]
+        assert v[0] == pytest.approx(want, rel=1e-12), (hours, model, stat)
+
+
+def test_the_interval_collapses_when_every_day_is_the_same():
+    daily = value_daily(
+        {
+            "perfect": (np.full(30, 200.0), np.full(30, 150.0)),
+            "naive": (np.full(30, 120.0), np.full(30, 100.0)),
+            "expert": (np.full(30, 160.0), np.full(30, 130.0)),
+            "expert_weather": (np.full(30, 170.0), np.full(30, 135.0)),
+        }
+    )
+    unc = forecast.uncertainty(daily, forecast.summarise(daily))
+    assert np.allclose(unc["ci_low"], unc["estimate"], rtol=1e-12, atol=1e-12)
+    assert np.allclose(unc["ci_high"], unc["estimate"], rtol=1e-12, atol=1e-12)
+    u = unc.set_index(["duration_h", "model", "statistic"])["estimate"]
+    assert u[(1, "naive", "net_capture_15min_pct")] == pytest.approx(60)
+    assert u[(1, "expert minus naive", "net_uplift_eur_per_mw_day")] == pytest.approx(10)
+
+
+def test_every_model_is_resampled_on_the_same_days():
+    # Expert earns naive's values plus 3 EUR/MW of uplift every day, so their paired difference
+    # is 3 on every resample while each model's own uplift varies a lot from day to day.
+    rng = np.random.default_rng(13)
+    n = 60
+    v15, vh = random_values(rng, n)
+    daily = value_daily(
+        {
+            "perfect": (v15 + 100, vh + 50),
+            "naive": (v15, vh),
+            "expert": (v15 + 3, vh),
+            "expert_weather": random_values(rng, n),
+        }
+    )
+    unc = forecast.uncertainty(daily, forecast.summarise(daily)).set_index(
+        ["duration_h", "model", "statistic"]
+    )
+    diff = unc.loc[(2, "expert minus naive", "net_uplift_eur_per_mw_day")]
+    assert diff[["estimate", "ci_low", "ci_high"]].tolist() == pytest.approx([3, 3, 3])
+    own = unc.loc[(2, "naive", "net_uplift_eur_per_mw_day")]
+    assert own["ci_high"] - own["ci_low"] > 2
+
+
+def test_kendall_tau_matches_hand_computed_values():
+    actual = [1.0, 2.0, 3.0, 4.0] * 2
+    fc = pd.DataFrame(
+        {
+            "delivery_date": [date(2026, 1, 1)] * 4 + [date(2026, 1, 2)] * 4,
+            "period": [1, 2, 3, 4] * 2,
+            "price_es": actual,
+            # Day 1: 5 concordant pairs, 1 discordant: tau 4/6. Day 2: 4 concordant, 2 tied in
+            # the forecast: tau-b 4 / sqrt(6 * 4).
+            "naive": [1.0, 3.0, 2.0, 4.0, 1.0, 1.0, 2.0, 2.0],
+            "expert": actual,
+            "expert_weather": [4.0, 3.0, 2.0, 1.0] * 2,
+        }
+    )
+    tau = forecast.daily_tau(fc, "naive")
+    assert tau.tolist() == pytest.approx([4 / 6, 4 / np.sqrt(24)])
+    e = forecast.errors(fc).set_index("model")["mean_daily_kendall_tau"]
+    assert e["naive"] == pytest.approx((4 / 6 + 4 / np.sqrt(24)) / 2)
+    assert e[["expert", "expert_weather"]].tolist() == pytest.approx([1, -1])
+
+
+def test_regret_drivers_match_hand_computed_values():
+    days = [date(2026, 1, 1) + timedelta(days=i) for i in range(4)]
+    actual = np.array([0.0, 10.0, 20.0, 30.0])
+    # Daily MAE 1, 5, 2, 20 and daily tau 1, 4/6, 1, -1, the same for every model.
+    forecasts = [actual + 1, [10.0, 0.0, 20.0, 30.0], actual + 2, actual[::-1]]
+    fc = pd.DataFrame(
+        {
+            "delivery_date": np.repeat(days, 4),
+            "period": [1, 2, 3, 4] * 4,
+            "price_es": np.tile(actual, 4),
+        }
+    )
+    for m in MODELS:
+        fc[m] = np.concatenate(forecasts)
+    # Regret 3, 1, 2, 4 for naive; expert's is 10 higher and expert_weather's 20 higher.
+    perfect = np.full(4, 100.0)
+    regret = np.array([3.0, 1.0, 2.0, 4.0])
+    daily = value_daily(
+        {"perfect": (perfect, perfect)}
+        | {m: (perfect - regret - 10 * k, perfect) for k, m in enumerate(MODELS)}
+    )
+    d = forecast.regret_drivers(fc, daily).set_index(["duration_h", "model"])
+    for hours in battery.DURATIONS_H:
+        for m in MODELS:
+            # Ranks of regret 3, 1, 2, 4 and of MAE 1, 3, 2, 4: 1 - 6 * 8 / (4 * 15) = 0.2.
+            # Ranks of tau 3.5, 2, 3.5, 1: Pearson of the ranks -1.5 / sqrt(5 * 4.5).
+            assert d.loc[(hours, m), "spearman_regret_mae"] == pytest.approx(0.2)
+            assert d.loc[(hours, m), "spearman_regret_tau"] == pytest.approx(-1 / np.sqrt(10))
+            assert d.loc[(hours, m), ["days", "observations"]].tolist() == [4, 4]
+        # Pooled, 12 days: regret ranks 1..12 (sum of squared deviations 143). MAE ranks 2, 8,
+        # 5, 11 for each model (deviations -4.5, 1.5, -1.5, 4.5; squares 135 over 12): the
+        # cross sum is 3 * (3 * -4.5 + 1 * 1.5 + 2 * -1.5 + 4 * 4.5) = 9. Tau ranks 9.5, 5, 9.5,
+        # 2 (deviations 3, -1.5, 3, -4.5; squares 121.5): cross sum 3 * -4.5 = -13.5.
+        pooled = d.loc[(hours, "pooled")]
+        assert pooled["spearman_regret_mae"] == pytest.approx(9 / np.sqrt(143 * 135))
+        assert pooled["spearman_regret_tau"] == pytest.approx(-13.5 / np.sqrt(143 * 121.5))
+        assert pooled[["days", "observations"]].tolist() == [4, 12]

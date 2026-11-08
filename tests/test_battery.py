@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from ib15.battery import (
+    BOOT_RESAMPLES,
     DT_15MIN,
     DT_HOURLY,
     DURATIONS_H,
@@ -19,13 +20,18 @@ from ib15.battery import (
     SENSITIVITY_COSTS,
     SOC_START,
     SPECS,
+    UNCERTAINTY_STATS,
     SolveError,
     Spec,
     _write_all,
+    bootstrap_days,
     cost_sensitivity,
     daily_values,
+    interval,
     solve_day,
     summarise,
+    uncertainty,
+    uplift_statistics,
 )
 from ib15.cli import main
 
@@ -291,6 +297,7 @@ RESULT_FILES = [
     "perfect_foresight_daily.parquet",
     "perfect_foresight_meta.json",
     "perfect_foresight_summary.csv",
+    "perfect_foresight_uncertainty.csv",
 ]
 
 
@@ -494,3 +501,102 @@ def test_hourly_prices_that_are_not_the_mean_are_rejected(tmp_path, capsys):
     assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1
     assert "not the mean" in capsys.readouterr().err
     assert not (data_dir / "results").exists()
+
+
+# ---------------------------------------------------------------- uncertainty
+
+
+def test_the_bootstrap_is_reproducible_with_the_seed():
+    a = bootstrap_days(30, resamples=50)
+    assert np.array_equal(a, bootstrap_days(30, resamples=50))
+    assert not np.array_equal(a, bootstrap_days(30, resamples=50, seed=1))
+    assert bootstrap_days(30).shape == (BOOT_RESAMPLES, 30)
+
+
+def test_bootstrap_blocks_are_contiguous_and_wrap_around():
+    n, block = 10, 7
+    idx = bootstrap_days(n, block=block, resamples=500)
+    assert idx.min() >= 0 and idx.max() < n
+    # Each row is a block of 7 days and the first 3 of a second block, each running on by one
+    # day and from the last day (9) back to the first (0).
+    for start, length in ((0, block), (block, n - block)):
+        b = idx[:, start : start + length]
+        assert (np.diff(b, axis=1) % n == 1).all()
+    assert ((idx[:, :-1] == n - 1) & (idx[:, 1:] == 0)).any()  # some block wraps
+
+
+@pytest.mark.parametrize("n", [1, 6, 7, 10, 404])
+def test_every_resample_has_as_many_days_as_the_sample(n):
+    assert bootstrap_days(n, resamples=20).shape == (20, n)
+
+
+def pf_daily(v15, vh) -> pd.DataFrame:
+    """A perfect_foresight_daily frame with the given net values a day (15 minutes and hourly),
+    the same for every duration and spec."""
+    days = [date(2025, 10, 1) + timedelta(days=i) for i in range(len(v15))]
+    rows = [
+        {
+            "delivery_date": d,
+            "duration_h": hours,
+            "spec": spec.name,
+            "resolution": res,
+            "gross_eur_per_mw": v[i],
+            "degradation_eur_per_mw": 0.0,
+            "net_eur_per_mw": v[i],
+            "discharged_mwh_per_mw": 1.0,
+            "cycles": 1.0,
+            "simultaneous_periods": 0,
+        }
+        for hours in DURATIONS_H
+        for spec in SPECS
+        for res, v in (("15min", v15), ("hourly", vh))
+        for i, d in enumerate(days)
+    ]
+    return pd.DataFrame(rows)
+
+
+def test_uncertainty_estimates_are_the_summary_values(tmp_path):
+    data_dir = dataset_dir(tmp_path)
+    assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
+    out = data_dir / "results"
+    summary = pd.read_csv(out / "perfect_foresight_summary.csv")
+    unc = pd.read_csv(out / "perfect_foresight_uncertainty.csv")
+    assert len(unc) == len(summary) * len(UNCERTAINTY_STATS)
+    for _, r in unc.iterrows():
+        row = summary[(summary["duration_h"] == r["duration_h"]) & (summary["spec"] == r["spec"])]
+        assert r["estimate"] == row[r["statistic"]].iloc[0]
+        assert r["days"] == 4
+    meta = json.loads((out / "perfect_foresight_meta.json").read_text())
+    assert meta["uncertainty"]["block_days"] == 7 and meta["uncertainty"]["resamples"] == 10_000
+    # The resampled statistic, on the original days, is the summary value.
+    daily = pd.read_parquet(out / "perfect_foresight_daily.parquet")
+    same = np.arange(4)[None]
+    for _, row in summary.iterrows():
+        stats = uplift_statistics(daily, row["duration_h"], row["spec"], same)
+        for name in UNCERTAINTY_STATS:
+            assert stats[name][0] == pytest.approx(row[name], rel=1e-9), (row["spec"], name)
+
+
+def test_the_interval_collapses_when_every_day_is_the_same():
+    daily = pf_daily(np.full(30, 130.0), np.full(30, 100.0))
+    unc = uncertainty(daily, summarise(daily))
+    assert np.allclose(unc["ci_low"], unc["estimate"], rtol=1e-12, atol=0)
+    assert np.allclose(unc["ci_high"], unc["estimate"], rtol=1e-12, atol=0)
+    assert set(unc["estimate"].round(9)) == {30.0}  # 30 EUR/MW a day, 30 % of the hourly value
+
+
+def test_the_interval_matches_the_normal_one_for_independent_days():
+    # Independent daily uplifts with sd 20 over 1000 days: the mean's 95% interval is about
+    # +-1.96 * 20 / sqrt(1000) = +-1.24 EUR/MW a day around the sample mean.
+    n = 1000
+    u = np.random.default_rng(3).normal(50, 20, n)
+    daily = pf_daily(100 + u, np.full(n, 100.0))
+    stats = uplift_statistics(daily, 1, "main", bootstrap_days(n))
+    lo, hi = interval(stats["net_uplift_eur_per_mw_day"])
+    half = 1.96 * u.std(ddof=1) / math.sqrt(n)
+    assert (hi - lo) / 2 == pytest.approx(half, rel=0.15)
+    assert (hi + lo) / 2 == pytest.approx(u.mean(), abs=0.15 * half)
+
+
+def test_an_undefined_statistic_has_no_bounds():
+    assert all(math.isnan(x) for x in interval([1.0, math.nan, 2.0]))
