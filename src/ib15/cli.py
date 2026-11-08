@@ -1,5 +1,5 @@
 """Command line: ``ib15 download omie|weather``, ``ib15 build [prices|weather]`` and
-``ib15 perfect-foresight`` and ``ib15 eda``."""
+``ib15 perfect-foresight``, ``ib15 eda`` and ``ib15 forecast``."""
 
 import argparse
 import os
@@ -7,7 +7,7 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from ib15 import battery, dataset, eda, omie, weather
+from ib15 import battery, dataset, eda, forecast, omie, weather
 
 ENV_DATA_DIR = "IB15_DATA_DIR"
 
@@ -122,6 +122,22 @@ def _eda(args) -> int:
     return 0
 
 
+def _forecast(args) -> int:
+    data_dir = _data_dir(args.data_dir)
+    try:
+        meta = forecast.run(data_dir)
+    except (dataset.BuildError, battery.SolveError) as e:
+        print(f"forecast failed:\n{e}", file=sys.stderr)
+        return 1
+    ev = meta["evaluation"]
+    print(
+        f"forecast {ev['start']} .. {ev['end']}: {ev['days']} evaluation days, forecasts in"
+        f" {meta['forecast_seconds']} s, solves in {meta['solve_seconds']} s -> "
+        f"{data_dir / 'results' / 'forecast'}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", help=f"data directory (default: ${ENV_DATA_DIR})")
@@ -172,6 +188,12 @@ def main(argv: list[str] | None = None) -> int:
         "eda", parents=[common], help="exploratory tables and figures for the paper"
     )
     ed.set_defaults(func=_eda)
+    fo = sub.add_parser(
+        "forecast",
+        parents=[common],
+        help="bid-time price forecasts and the battery value they capture",
+    )
+    fo.set_defaults(func=_forecast)
 
     args = parser.parse_args(argv)
     return args.func(args)
