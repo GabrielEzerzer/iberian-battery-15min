@@ -140,16 +140,42 @@ def test_settled_chunk_with_nulls_is_fetched_again_and_replaced(tmp_path):
     assert (tmp_path / with_nulls).read_bytes() == body("madrid", *OCT)
 
 
-def test_narrower_rerun_keeps_the_wider_file_and_deletes_a_covered_one(tmp_path):
-    full = weather.file_name("madrid", date(2025, 10, 1), date(2025, 10, 31))
-    (tmp_path / full).write_bytes(body("madrid", date(2025, 10, 1), date(2025, 10, 31)))
+def test_rerun_keeps_a_partly_overlapping_file_and_deletes_a_covered_one(tmp_path):
+    # Oct 1-20 overlaps Oct 15-31 without covering it, so the chunk is fetched.
+    part = weather.file_name("madrid", date(2025, 10, 1), date(2025, 10, 20))
+    (tmp_path / part).write_bytes(body("madrid", date(2025, 10, 1), date(2025, 10, 20)))
     covered = weather.file_name("sevilla", date(2025, 10, 20), date(2025, 10, 25))
     (tmp_path / covered).write_bytes(body("sevilla", date(2025, 10, 20), date(2025, 10, 25)))
     r = run(tmp_path, FakeOpenMeteo(), date(2025, 10, 15), date(2025, 10, 31))
     assert not r.errors and len(r.saved) == 2
     narrow = [weather.file_name(loc, date(2025, 10, 15), date(2025, 10, 31)) for loc in TWO]
-    # Oct 1-14 survive in the wider madrid file; the sevilla file inside the new range is gone.
-    assert names(tmp_path) == sorted([full, *narrow])
+    # Oct 1-14 survive in the older madrid file; the sevilla file inside the new range is gone.
+    assert names(tmp_path) == sorted([part, *narrow])
+
+
+def test_narrower_rerun_inside_a_complete_saved_month_is_skipped(tmp_path):
+    month = (date(2025, 10, 1), date(2025, 10, 31))
+    full = [weather.file_name(loc, *month) for loc in TWO]
+    run(tmp_path, FakeOpenMeteo(), *month)
+    fake = FakeOpenMeteo()
+    r = run(tmp_path, fake, date(2025, 10, 15), date(2025, 10, 31))
+    assert fake.requested == [] and not r.saved and not r.errors
+    assert r.skipped == [
+        weather.file_name(loc, date(2025, 10, 15), date(2025, 10, 31)) for loc in TWO
+    ]
+    assert names(tmp_path) == sorted(full)
+    weather.load_hourly(tmp_path)  # no overlap error
+
+
+def test_incomplete_covering_file_does_not_skip_a_narrower_chunk(tmp_path):
+    month = (date(2025, 10, 1), date(2025, 10, 31))
+    d = json.loads(body("madrid", *month))
+    d["hourly"]["temperature_2m_previous_day2"][-5:] = [None] * 5
+    (tmp_path / weather.file_name("madrid", *month)).write_text(json.dumps(d))
+    (tmp_path / weather.file_name("sevilla", *month)).write_bytes(b"stale")
+    fake = FakeOpenMeteo()
+    r = run(tmp_path, fake, date(2025, 10, 15), date(2025, 10, 31))
+    assert len(fake.requested) == 2 and not r.skipped and len(r.saved) == 2
 
 
 def test_recent_chunk_is_fetched_again_and_replaces_the_shorter_file(tmp_path):
