@@ -80,6 +80,35 @@ This writes the tables and figures that describe the data and where the 15-minut
 - Figures, each as PNG and PDF: `fig_a` daily mean price and daily mean spread; `fig_b` average price by quarter-hour of day for each season, with the hourly benchmark of one season as steps (each season pools every year of the sample, so autumn mixes the autumns of 2025 and 2026); `fig_c` mean deviation of each quarter from its hourly mean by hour of day; `fig_d` distribution of the within-hour spread; `fig_e` uplift by month; `fig_f` daily uplift against the day's mean spread; `fig_g` uplift against the wear cost, drawn only when `perfect_foresight_cost_sensitivity.csv` exists (otherwise a `fig_g` left by an earlier run is deleted once the new outputs are in place); `fig_h` price against national mean radiation and wind.
 - `eda_meta.json`: the inputs with their row counts and date ranges, the outputs, anything skipped, and the git commit.
 
+## Forecast
+
+```
+uv run ib15 forecast    # after `ib15 build` and `ib15 build weather`
+```
+
+This forecasts the Spanish price of each delivery day using only public data that was available before the day's bid, lets the battery plan on the forecast, pays it the actual prices, and compares what it earns with the perfect-foresight value on the same days.
+
+Bids for delivery day D close at 12:00 Madrid time on D-1. The forecast for D uses the prices of every delivery day up to D-1, which are public by then (D-1's prices appear at about 13:00 on D-2), and the weather forecasts for D in `prices_weather_15min.parquet`, which `build weather` has checked were issued before the deadline. It uses nothing from D's prices or any later day.
+
+Each day is represented by its 96 local quarter-hours (Europe/Madrid). On the 92-period day in March the missing hour takes the values of the hour before it, and on the 100-period day in October the two occurrences of the repeated hour are averaged; the weather is treated the same way. A forecast is then mapped back to the day's real periods: both occurrences of the repeated hour get the same forecast, and the missing hour is dropped. There are three models:
+
+- `naive`: the price of the same quarter-hour a week earlier for Mondays, Saturdays and Sundays, and a day earlier otherwise.
+- `expert`: one least-squares regression per quarter-hour of the day, refitted every day on the 56 days before D. The window was fixed in advance, not tuned. The regressors are an intercept, the price of the same quarter-hour on D-1, D-2 and D-7, the lowest, highest and last quarter-hour price of D-1, and dummies for Monday, Saturday and Sunday.
+- `expert_weather`: the expert model plus the national mean temperature, 100 m wind speed and radiation forecast for that quarter-hour of D, each the mean of the ten locations.
+
+Public holidays are not modelled. The first evaluation day is the 64th day of the dataset (2025-12-03), the first whose 56-day window has every lag; every model and the perfect-foresight benchmark are compared on the same days from there to the end of the data. The hourly forecast is the mean of each hour's four quarter-hour forecasts, so both resolutions use the same information.
+
+The battery is the `main` specification (20 EUR per MWh discharged) at 1, 2 and 4 hours. For each model and resolution, the day's schedule is optimised on the forecast and then paid the actual prices: the 15-minute schedule at the 15-minute prices, the hourly schedule at the hourly prices. The net value is the gross revenue at actual prices minus 20 EUR for each MWh actually discharged. The `perfect` rows plan on the actual prices. The command stops with an error if a forecast earns more than perfect foresight on any day, duration and resolution (beyond 1e-6 EUR/MW), since that cannot happen.
+
+It checks every input before it writes anything. It stops with an error if `prices_15min.parquet`, `prices_hourly.parquet` or `prices_weather_15min.parquet` is missing, if the weather file does not hold exactly the rows and prices of `prices_15min.parquet`, if an hourly price is not the mean of its quarter-hours, if the days are not consecutive, or if there are fewer than 64 days. It writes to `$IB15_DATA_DIR/results/forecast/`, replacing the previous files all together or not at all, in the same way as the perfect-foresight results:
+
+- `forecasts_15min.parquet`: one row per 15-minute period of the evaluation days, with its UTC start, delivery date, period, actual price and each model's forecast.
+- `forecast_errors.csv`: per model, the mean absolute error and root mean square error at 15 minutes and at the hourly resolution, and the mean absolute error of the within-hour deviation (a quarter-hour's price minus its hour's mean, forecast against actual). The 15-minute uplift comes from that within-hour shape.
+- `forecast_dm_tests.csv`: Diebold–Mariano tests of `expert` against `naive` and of `expert_weather` against `expert`, on each day's mean absolute 15-minute error. The variance is Newey–West with Bartlett weights and a lag of 7 days, and the p-value is two-sided from the normal distribution. Each row gives the number of days, the mean loss difference (first model minus second, so negative favours the first), the statistic and the p-value.
+- `forecast_value_daily.parquet`: one row per evaluation day, duration, model (`perfect`, `naive`, `expert`, `expert_weather`) and resolution, with gross revenue, wear cost and net value in EUR per MW and the MWh discharged, all at actual prices.
+- `forecast_value_summary.csv`: per duration and model, the net value, gross revenue and wear cost over the evaluation days at both resolutions in kEUR/MW, the net value as a percentage of perfect foresight at the same resolution, and the 15-minute uplift (15-minute net minus hourly net) in kEUR/MW, in EUR/MW a day and as a percentage of the perfect-foresight uplift. A forecast's uplift can be negative.
+- `forecast_meta.json`: the timing rule, the window, each model's regressors, the evaluation dates and count, the Diebold–Mariano settings, the battery specification, the forecast and solve times and the git commit.
+
 ## Tests
 
 Run the tests with `uv run pytest`. They run offline.
