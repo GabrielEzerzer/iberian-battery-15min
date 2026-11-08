@@ -50,7 +50,7 @@ Bids for delivery day D close at 12:00 Madrid time on D-1. Every forecast value 
 uv run ib15 perfect-foresight    # after `ib15 build`
 ```
 
-This computes the most a battery could have earned on each delivery day if it had known the day's Spanish day-ahead prices (`price_es`) in advance. It does this once with the 15-minute prices and once with the hourly benchmark, where charging and discharging power stay constant for each whole hour.
+This computes the most a battery could have earned on each delivery day if it had known the day's Spanish day-ahead prices (`price_es`) in advance. The main setting is also run on the Portuguese prices, as a check (see `perfect_foresight_portugal.csv` below). It does this once with the 15-minute prices and once with the hourly benchmark, where charging and discharging power stay constant for each whole hour.
 
 The battery has 1 MW of power and 1, 2 or 4 hours of storage (1, 2 or 4 MWh). Its round-trip efficiency is 88%, split equally between charging and discharging. Every delivery day, including the DST change days, starts and ends half full and is optimised on its own as a linear programme solved with HiGHS. There are three specifications. `main` charges 20 EUR for every MWh discharged as a degradation cost. `no_cost` has no degradation cost. `cap2` has no degradation cost and allows at most two full cycles a day.
 

@@ -666,12 +666,15 @@ def test_price_agreement_on_a_hand_computed_case():
     # Two hours. Spain: 10, 20, 30, 40 | 50, 50, 50, 50. Portugal: 10, 20, 30, 40 | 46, 50, 58, 50.
     es = [10.0, 20.0, 30.0, 40.0, 50.0, 50.0, 50.0, 50.0]
     pt = [10.0, 20.0, 30.0, 40.0, 46.0, 50.0, 58.0, 50.0]
-    q, _ = price_tables([es], [pt])
+    # A second day 100 EUR/MWh higher has the same spreads, so pooling the days by hour of day
+    # (spread 130 in the first hour) would show.
+    up = [[p + 100 for p in day] for day in (es, pt)]
+    q, _ = price_tables([es, up[0]], [pt, up[1]])
     a = price_agreement(q.iloc[::-1])  # row order does not matter
-    assert a["quarter_hours"] == 8
-    assert a["share_pt_equal_to_es"] == 6 / 8
-    assert a["mean_abs_pt_minus_es_eur_per_mwh"] == pytest.approx((4 + 8) / 8)
-    # Spreads: Spain 30 and 0, Portugal 30 and 12.
+    assert a["quarter_hours"] == 16
+    assert a["share_pt_equal_to_es"] == 12 / 16
+    assert a["mean_abs_pt_minus_es_eur_per_mwh"] == pytest.approx(2 * (4 + 8) / 16)
+    # Spreads on each day: Spain 30 and 0, Portugal 30 and 12.
     assert a["mean_within_hour_spread_eur_per_mwh"] == pytest.approx({"es": 15.0, "pt": 21.0})
 
 
