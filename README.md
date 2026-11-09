@@ -120,3 +120,7 @@ It checks every input before it writes anything. It stops with an error if `pric
 ## Tests
 
 Run the tests with `uv run pytest`. They run offline.
+
+## Licence and citation
+
+The code is under the MIT licence (`LICENSE`). To cite it, use `CITATION.cff`; GitHub shows it as "Cite this repository". The data the code downloads keeps its own terms: OMIE allows free use of its public data if the source is cited and the original content is left unaltered, and the ECMWF forecasts served by Open-Meteo are under CC BY 4.0. Derived series, such as the hourly benchmark, are the author's, built from OMIE data.
