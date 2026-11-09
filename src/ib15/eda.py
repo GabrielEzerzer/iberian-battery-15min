@@ -12,6 +12,7 @@ series move together over the sample, not what a forecast will achieve.
 import json
 import math
 import time
+from datetime import date
 from pathlib import Path
 
 import matplotlib
@@ -22,7 +23,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from ib15.battery import DURATIONS_H, _write_all  # noqa: E402
-from ib15.dataset import BuildError, _git  # noqa: E402
+from ib15.dataset import BuildError, _git, hourly_benchmark  # noqa: E402
 from ib15.omie import MADRID  # noqa: E402
 from ib15.weather import LOCATIONS, VARIABLES  # noqa: E402
 
@@ -53,6 +54,13 @@ SEASONS = {
     11: "autumn",
 }
 SEASON_ORDER = ("winter", "spring", "summer", "autumn")
+# Windows of one_cycle_spread.csv: the first two months of 15-minute prices, which came before
+# Rystad Energy's estimate of 10 December 2025, and the whole sample (None means its first or
+# last day).
+SPREAD_WINDOWS = {
+    "oct_nov_2025": (date(2025, 10, 1), date(2025, 11, 30)),
+    "full": (None, None),
+}
 WEATHER_LABELS = {
     "temperature_2m": "temperature (°C)",
     "wind_speed_100m": "wind speed at 100 m (m/s)",
@@ -270,6 +278,44 @@ def uplift_concentration(up: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def one_cycle_spread(q: pd.DataFrame) -> pd.DataFrame:
+    """A spread-based reconstruction consistent with Rystad Energy's published description of its
+    15-minute gain: a 1-hour battery cycling once a day with perfect foresight. Rystad states no
+    treatment of losses, wear or order; this assumes none of them, so charging need not come
+    before discharging. Per market and window, the mean daily 15-minute spread (mean of the
+    day's four highest quarter-hour prices minus mean of its four lowest), the mean daily hourly
+    spread (highest minus lowest hour of the hourly benchmark) and the uplift as their ratio."""
+    hourly = hourly_benchmark(q)
+    rows = []
+    for market in ("es", "pt"):
+        col = f"price_{market}"
+        days = pd.DataFrame(
+            {
+                "s15": q.groupby("delivery_date")[col].agg(
+                    lambda p: np.sort(p)[-4:].mean() - np.sort(p)[:4].mean()
+                ),
+                "sh": hourly.groupby("delivery_date")[col].agg(lambda p: p.max() - p.min()),
+            }
+        )
+        for window, (start, end) in SPREAD_WINDOWS.items():
+            start = days.index.min() if start is None else start
+            end = days.index.max() if end is None else end
+            w = days[(days.index >= start) & (days.index <= end)]
+            rows.append(
+                {
+                    "market": market,
+                    "window": window,
+                    "start": w.index.min(),
+                    "end": w.index.max(),
+                    "days": len(w),
+                    "spread_15min_eur_per_mwh": w["s15"].mean(),
+                    "spread_hourly_eur_per_mwh": w["sh"].mean(),
+                    "uplift_pct": 100 * (w["s15"].sum() / w["sh"].sum() - 1),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def weather_summary(weather: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for loc in LOCATIONS:
@@ -475,7 +521,6 @@ def fig_quarter_deviation(q: pd.DataFrame) -> plt.Figure:
     ax.set_xlim(-0.5, 23.5)
     ax.set_xlabel("hour of day, local time (Madrid)")
     ax.set_ylabel("quarter price − hourly mean (EUR/MWh)")
-    ax.set_title("Mean deviation of each quarter-hour from its hourly mean")
     ax.legend(ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.2))
     return fig
 
@@ -523,7 +568,6 @@ def fig_uplift_month(by_month: pd.DataFrame) -> plt.Figure:
     ax.set_xticks(range(len(months)), labels, rotation=45, ha="right")
     ax.set_ylim(bottom=0)
     ax.set_ylabel("uplift (EUR/MW per day)")
-    ax.set_title("Perfect-foresight 15-minute uplift over hourly, by month (main spec)")
     ax.legend(title="duration")
     return fig
 
@@ -544,7 +588,6 @@ def fig_uplift_scatter(up: pd.DataFrame, daily: pd.DataFrame) -> plt.Figure:
         ax.set_title(f"{dur} h battery")
     axes[0].set_ylabel("daily uplift (EUR/MW)")
     fig.supxlabel("day's mean within-hour spread (EUR/MWh)", fontsize=8)
-    fig.suptitle("Daily 15-minute uplift against the day's mean within-hour spread (main spec)")
     return fig
 
 
@@ -652,6 +695,7 @@ def run(data_dir: Path) -> dict:
         "within_hour_spread.csv": within_hour_table(hours),
         "uplift_by_month.csv": uplift_by_month(up, q, hours),
         "uplift_concentration.csv": uplift_concentration(up, daily),
+        "one_cycle_spread.csv": one_cycle_spread(q),
         "weather_summary.csv": weather_summary(weather),
         "forecast_motivation.csv": forecast_motivation(q, hours, daily, wx),
     }
