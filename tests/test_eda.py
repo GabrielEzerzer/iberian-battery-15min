@@ -101,6 +101,42 @@ def test_autocorr_periodic_and_sign_flipping():
     assert n7 == 96 * 13
 
 
+def test_one_cycle_spread_by_hand():
+    # 2025-10-21: four quarter-hours at 0, each in a different hour (hourly means 37.5), and one
+    # at 100 (its hour's mean 62.5), the rest 50. Four highest quarters average 62.5, four
+    # lowest 0, so the 15-minute spread is 62.5 and the hourly spread 62.5 - 37.5 = 25.
+    # 2025-10-26 (100 periods): first hour at 10 and the 25th hour at 90, so both spreads are 80.
+    # 2025-12-01, outside oct_nov_2025: one quarter at 30 and one at 70, both spreads 10.
+    days = [date(2025, 10, 21), date(2025, 10, 26), date(2025, 12, 1)]
+    q = prices(days, price_fn=lambda i: 50.0)
+    d1, d2, d3 = (q["delivery_date"] == d for d in days)
+    q.loc[d1 & q["period"].isin([1, 5, 9, 13]), "price_es"] = 0.0
+    q.loc[d1 & (q["period"] == 17), "price_es"] = 100.0
+    q.loc[d2 & q["period"].between(1, 4), "price_es"] = 10.0
+    q.loc[d2 & q["period"].between(97, 100), "price_es"] = 90.0
+    q.loc[d3 & (q["period"] == 1), "price_es"] = 30.0
+    q.loc[d3 & (q["period"] == 96), "price_es"] = 70.0
+    q["price_pt"] = 2 * q["price_es"]  # spreads double, uplift unchanged
+    t = eda.one_cycle_spread(q).set_index(["market", "window"])
+    assert list(t.index) == [
+        ("es", "oct_nov_2025"),
+        ("es", "full"),
+        ("pt", "oct_nov_2025"),
+        ("pt", "full"),
+    ]
+    for market, k in (("es", 1), ("pt", 2)):
+        r = t.loc[(market, "oct_nov_2025")]
+        assert (r["start"], r["end"], r["days"]) == (days[0], days[1], 2)
+        assert r["spread_15min_eur_per_mwh"] == pytest.approx(k * (62.5 + 80) / 2)
+        assert r["spread_hourly_eur_per_mwh"] == pytest.approx(k * (25 + 80) / 2)
+        assert r["uplift_pct"] == pytest.approx(100 * (142.5 / 105 - 1))
+        r = t.loc[(market, "full")]
+        assert (r["start"], r["end"], r["days"]) == (days[0], days[2], 3)
+        assert r["spread_15min_eur_per_mwh"] == pytest.approx(k * 152.5 / 3)
+        assert r["spread_hourly_eur_per_mwh"] == pytest.approx(k * 115 / 3)
+        assert r["uplift_pct"] == pytest.approx(100 * (152.5 / 115 - 1))
+
+
 def weather_frame(hours):
     """Hourly weather for the 10 locations: location j has value j + hour index for every
     variable, so the national mean at hour i is 4.5 + i."""
@@ -231,6 +267,7 @@ TABLES = [
     "within_hour_spread.csv",
     "uplift_by_month.csv",
     "uplift_concentration.csv",
+    "one_cycle_spread.csv",
     "weather_summary.csv",
     "forecast_motivation.csv",
 ]
