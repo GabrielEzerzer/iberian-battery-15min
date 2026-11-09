@@ -102,14 +102,15 @@ def test_autocorr_periodic_and_sign_flipping():
 
 
 def test_one_cycle_spread_by_hand():
-    # 2025-10-21: four quarter-hours at 0, each in a different hour (hourly means 37.5), and one
-    # at 100 (its hour's mean 62.5), the rest 50. Four highest quarters average 62.5, four
-    # lowest 0, so the 15-minute spread is 62.5 and the hourly spread 62.5 - 37.5 = 25.
+    # 2025-11-30, the window's last day: four quarter-hours at 0, each in a different hour
+    # (hourly means 37.5), and one at 100 (its hour's mean 62.5), the rest 50. Four highest
+    # quarters average 62.5, four lowest 0, so the 15-minute spread is 62.5 and the hourly
+    # spread 62.5 - 37.5 = 25.
     # 2025-10-26 (100 periods): first hour at 10 and the 25th hour at 90, so both spreads are 80.
     # 2025-12-01, outside oct_nov_2025: one quarter at 30 and one at 70, both spreads 10.
-    days = [date(2025, 10, 21), date(2025, 10, 26), date(2025, 12, 1)]
+    days = [date(2025, 10, 26), date(2025, 11, 30), date(2025, 12, 1)]
     q = prices(days, price_fn=lambda i: 50.0)
-    d1, d2, d3 = (q["delivery_date"] == d for d in days)
+    d2, d1, d3 = (q["delivery_date"] == d for d in days)
     q.loc[d1 & q["period"].isin([1, 5, 9, 13]), "price_es"] = 0.0
     q.loc[d1 & (q["period"] == 17), "price_es"] = 100.0
     q.loc[d2 & q["period"].between(1, 4), "price_es"] = 10.0
