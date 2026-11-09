@@ -520,7 +520,6 @@ def fig_quarter_deviation(q: pd.DataFrame) -> plt.Figure:
     ax.set_xlim(-0.5, 23.5)
     ax.set_xlabel("hour of day, local time (Madrid)")
     ax.set_ylabel("quarter price − hourly mean (EUR/MWh)")
-    ax.set_title("Mean deviation of each quarter-hour from its hourly mean")
     ax.legend(ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.2))
     return fig
 
@@ -568,7 +567,6 @@ def fig_uplift_month(by_month: pd.DataFrame) -> plt.Figure:
     ax.set_xticks(range(len(months)), labels, rotation=45, ha="right")
     ax.set_ylim(bottom=0)
     ax.set_ylabel("uplift (EUR/MW per day)")
-    ax.set_title("Perfect-foresight 15-minute uplift over hourly, by month (main spec)")
     ax.legend(title="duration")
     return fig
 
@@ -589,7 +587,6 @@ def fig_uplift_scatter(up: pd.DataFrame, daily: pd.DataFrame) -> plt.Figure:
         ax.set_title(f"{dur} h battery")
     axes[0].set_ylabel("daily uplift (EUR/MW)")
     fig.supxlabel("day's mean within-hour spread (EUR/MWh)", fontsize=8)
-    fig.suptitle("Daily 15-minute uplift against the day's mean within-hour spread (main spec)")
     return fig
 
 
