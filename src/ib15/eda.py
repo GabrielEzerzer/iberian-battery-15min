@@ -279,9 +279,10 @@ def uplift_concentration(up: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
 
 
 def one_cycle_spread(q: pd.DataFrame) -> pd.DataFrame:
-    """Rystad Energy's stated measure of the 15-minute gain: a 1-hour battery cycling once a day
-    with perfect foresight, no losses and no wear, with charging not required to come before
-    discharging. Per market and window, the mean daily 15-minute spread (mean of the day's four
+    """A spread-based reconstruction consistent with Rystad Energy's published description of its
+    15-minute gain: a 1-hour battery cycling once a day with perfect foresight. Rystad states no
+    treatment of losses, wear or order; this assumes none of them, so charging need not come
+    before discharging. Per market and window, the mean daily 15-minute spread (mean of the day's four
     highest quarter-hour prices minus mean of its four lowest), the mean daily hourly spread
     (highest minus lowest hour of the hourly benchmark) and the uplift as a ratio of the two."""
     hourly = hourly_benchmark(q)
