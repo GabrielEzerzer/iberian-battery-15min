@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this code or its results, please cite it as below."
+type: software
+title: "ib15: code for the paper 'What 15-minute prices are worth to a battery in Spain'"
+abstract: >-
+  Builds a validated dataset of OMIE 15-minute day-ahead prices and archived
+  weather forecasts, and computes the battery arbitrage value of 15-minute
+  against hourly prices with perfect foresight and with forecasts made from
+  public data at bid time.
+authors:
+  - family-names: Ezerzer
+    given-names: Gabriel
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/GabrielEzerzer/iberian-battery-15min"
+keywords:
+  - electricity markets
+  - battery storage
+  - energy arbitrage
+  - 15-minute prices
+  - OMIE
+  - price forecasting
