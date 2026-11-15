@@ -43,9 +43,9 @@ def test_within_hour_spread_and_flat_share_on_dst_day():
     q.loc[q["period"].between(97, 100), "price_es"] = [5.0, 5.0, 5.0, 9.0]
     h = eda.hour_table(q)
     assert len(h) == 25, "2025-10-26 is the autumn DST day: 100 periods, 25 hours"
-    assert h.loc[0, "spread"] == 30.0
+    assert h.loc[0, "spread"] == 30.0, "10, 30, 20, 40: spread 30"
     assert h.loc[0, "slope"] == 30.0, "40 - 10"
-    assert h.loc[24, "spread"] == 4.0
+    assert h.loc[24, "spread"] == 4.0, "25th hour 5, 5, 5, 9: spread 4"
     assert h.loc[24, "hour"] == 24
     s = eda.spread_summary(h)
     assert s["hours"] == 25

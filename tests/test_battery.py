@@ -638,7 +638,7 @@ def test_the_interval_collapses_when_every_day_is_the_same():
     assert unc.groupby("statistic")["estimate"].first().round(9).to_dict() == {
         "net_uplift_eur_per_mw_day": 30.0,
         "net_uplift_pct": 25.0,
-    }
+    }, "150 against 120: 30 EUR/MW a day, 25% of the hourly value"
 
 
 def test_the_interval_matches_the_normal_one_for_independent_days():
@@ -722,7 +722,8 @@ def test_price_agreement_on_a_hand_computed_case():
     q, _ = price_tables(
         [es, second_day_100_higher_same_spreads[0]], [pt, second_day_100_higher_same_spreads[1]]
     )
-    a = price_agreement(q.iloc[::-1])
+    row_order_does_not_matter = q.iloc[::-1]
+    a = price_agreement(row_order_does_not_matter)
     assert a["quarter_hours"] == 16
     assert a["share_pt_equal_to_es"] == 12 / 16
     assert a["mean_abs_pt_minus_es_eur_per_mwh"] == pytest.approx(2 * (4 + 8) / 16)
