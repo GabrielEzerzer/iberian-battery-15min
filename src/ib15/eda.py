@@ -1,14 +1,5 @@
-"""Exploratory analysis for the paper: tables and figures that describe the prices, the weather
-and where the perfect-foresight 15-minute uplift comes from.
-
-The computed quantities are small pure functions (within-hour spread, quarter deviations,
-concentration shares, autocorrelation at a lag, national mean weather); ``run`` checks the
-inputs, builds the tables and figures and writes them to ``data_dir/results/eda`` all together
-or not at all.
-Every correlation here is a plain Pearson coefficient and is descriptive only: it says how the
-series move together over the sample, not what a forecast will achieve.
-"""
-
+# Exploratory tables and figures for the paper: the prices, the weather and where the 15-minute
+# uplift comes from.
 import json
 import math
 import time
@@ -18,21 +9,17 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
-from ib15.battery import DURATIONS_H, _write_all  # noqa: E402
-from ib15.dataset import BuildError, _git, hourly_benchmark  # noqa: E402
-from ib15.omie import MADRID  # noqa: E402
-from ib15.weather import LOCATIONS, VARIABLES  # noqa: E402
+from ib15.battery import DURATIONS_H, _write_all
+from ib15.dataset import BuildError, _git, hourly_benchmark
+from ib15.omie import MADRID
+from ib15.weather import LOCATIONS, VARIABLES
 
-# Prices have two decimals, so a smaller max - min means the four quarter-hours are equal.
-FLAT_TOL = 0.005  # EUR/MWh
-# Both resolutions are solved to HiGHS tolerances; a daily difference below this is zero.
-ZERO_UPLIFT_TOL = 0.01  # EUR/MW
-# The columns of perfect_foresight_cost_sensitivity.csv (battery.cost_sensitivity) that figure G
-# plots.
+FLAT_TOL_EUR_PER_MWH = 0.005
+ZERO_UPLIFT_TOL_EUR_PER_MW = 0.01
 SENSITIVITY_COLUMNS = (
     "duration_h",
     "cost_eur_per_mwh",
@@ -54,9 +41,6 @@ SEASONS = {
     11: "autumn",
 }
 SEASON_ORDER = ("winter", "spring", "summer", "autumn")
-# Windows of one_cycle_spread.csv: the first two months of 15-minute prices, which came before
-# Rystad Energy's estimate of 10 December 2025, and the whole sample (None means its first or
-# last day).
 SPREAD_WINDOWS = {
     "oct_nov_2025": (date(2025, 10, 1), date(2025, 11, 30)),
     "full": (None, None),
@@ -67,24 +51,16 @@ WEATHER_LABELS = {
     "shortwave_radiation": "solar radiation (W/m²)",
 }
 
-# Plot style: the dataviz reference palette, light mode (a paper is printed on white).
-SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")  # fixed order, never cycled
+SERIES = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")
 INK = "#0b0b0b"
 INK_2 = "#52514e"
 GRID = "#e1e0d9"
 AXIS = "#c3c2b7"
 DPI = 300
-WIDTH = 6.5  # inches, a single text column
-
-
-# ---------------------------------------------------------------- pure functions
+FIGURE_WIDTH_INCHES = 6.5
 
 
 def hour_table(q: pd.DataFrame) -> pd.DataFrame:
-    """One row per delivery hour: the hour is the group of four consecutive periods of a local
-    delivery_date, as in ``dataset.hourly_benchmark``, so a 100-period DST day has 25 hours.
-    Columns: delivery_date, hour, start_utc, mean, spread (max - min of the four quarters),
-    slope (Q4 - Q1), abs_dev (mean absolute deviation of a quarter from the hour's mean)."""
     q = q.sort_values(["delivery_date", "period"])
     h = q.assign(hour=(q["period"] - 1) // 4, dev=quarter_deviation(q).abs())
     g = h.groupby(["delivery_date", "hour"], sort=True)
@@ -106,7 +82,6 @@ def hour_table(q: pd.DataFrame) -> pd.DataFrame:
 
 
 def quarter_deviation(q: pd.DataFrame) -> pd.Series:
-    """Each quarter-hour's price minus the mean of its hour (aligned to ``q``'s index)."""
     hour = (q["period"] - 1) // 4
     return q["price_es"] - q.groupby([q["delivery_date"], hour])["price_es"].transform("mean")
 
@@ -118,7 +93,7 @@ def spread_summary(hours: pd.DataFrame) -> dict:
         "mean_spread": s.mean(),
         "median_spread": s.median(),
         "p90_spread": s.quantile(0.9),
-        "share_flat_hours": (s < FLAT_TOL).mean(),
+        "share_flat_hours": (s < FLAT_TOL_EUR_PER_MWH).mean(),
         "mean_abs_quarter_deviation": hours["abs_dev"].mean(),
     }
 
@@ -141,24 +116,19 @@ def price_stats(prices: pd.Series, days: int) -> dict:
 
 
 def concentration(uplift) -> dict:
-    """How concentrated a vector of daily uplifts is: the share of the total from the top 10% and
-    25% of days (rounded up to whole days), the share of days with zero uplift, median, mean."""
     u = np.sort(np.asarray(uplift, dtype=float))[::-1]
     total = u.sum()
     out = {}
     for frac in (0.10, 0.25):
         k = math.ceil(frac * len(u) - 1e-9)
         out[f"share_from_top_{round(frac * 100)}pct_days"] = u[:k].sum() / total
-    out["share_days_zero_uplift"] = float(np.mean(np.abs(u) < ZERO_UPLIFT_TOL))
+    out["share_days_zero_uplift"] = float(np.mean(np.abs(u) < ZERO_UPLIFT_TOL_EUR_PER_MW))
     out["median_daily_uplift_eur_per_mw"] = float(np.median(u))
     out["mean_daily_uplift_eur_per_mw"] = float(np.mean(u))
     return out
 
 
 def autocorr(s: pd.Series, lag: pd.Timedelta) -> tuple[float, int]:
-    """Pearson correlation of a series indexed by UTC time with itself ``lag`` earlier, and the
-    number of pairs. A lag of whole days pairs the same local quarter-hour except across a DST
-    change, where it is one hour off."""
     lagged = s.reindex(s.index - lag).to_numpy()
     x = pd.Series(s.to_numpy())
     y = pd.Series(lagged)
@@ -166,8 +136,6 @@ def autocorr(s: pd.Series, lag: pd.Timedelta) -> tuple[float, int]:
 
 
 def national_mean(weather: pd.DataFrame) -> pd.DataFrame:
-    """Mean of each weather variable across the locations, per UTC hour (index
-    ``valid_time_utc``). Raises BuildError unless every hour has every location exactly once."""
     counts = weather.groupby("valid_time_utc")["location"].agg(["nunique", "size"])
     if (
         set(weather["location"]) != set(LOCATIONS)
@@ -178,8 +146,6 @@ def national_mean(weather: pd.DataFrame) -> pd.DataFrame:
 
 
 def daily_uplift(pf: pd.DataFrame) -> pd.DataFrame:
-    """Per delivery_date and duration_h of the ``main`` spec: net value at both resolutions and
-    the 15-minute uplift, in EUR/MW."""
     m = pf[pf["spec"] == "main"]
     w = m.pivot_table(
         index=["delivery_date", "duration_h"], columns="resolution", values="net_eur_per_mw"
@@ -189,9 +155,6 @@ def daily_uplift(pf: pd.DataFrame) -> pd.DataFrame:
     w = w.rename(columns={"15min": "net_15min", "hourly": "net_hourly"})
     w["uplift"] = w["net_15min"] - w["net_hourly"]
     return w[["delivery_date", "duration_h", "net_15min", "net_hourly", "uplift"]]
-
-
-# ---------------------------------------------------------------- tables
 
 
 def _month(dates: pd.Series) -> pd.Series:
@@ -215,8 +178,6 @@ def within_hour_table(hours: pd.DataFrame) -> pd.DataFrame:
 
 
 def daily_table(q: pd.DataFrame, hours: pd.DataFrame, wx: pd.DataFrame) -> pd.DataFrame:
-    """Per delivery_date: mean price, price range, mean within-hour spread and the day's mean
-    of each national weather variable over its hours."""
     d = q.groupby("delivery_date")["price_es"].agg(["mean", "max", "min"])
     out = pd.DataFrame(
         {
@@ -232,8 +193,6 @@ def daily_table(q: pd.DataFrame, hours: pd.DataFrame, wx: pd.DataFrame) -> pd.Da
 
 
 def uplift_by_month(up: pd.DataFrame, q: pd.DataFrame, hours: pd.DataFrame) -> pd.DataFrame:
-    """Per month and duration: net values, uplift, and the month's mean within-hour spread (over
-    its hours) and mean 15-minute price (over its quarter-hours)."""
     up = up.assign(month=_month(up["delivery_date"]))
     hm = pd.DataFrame(
         {
@@ -279,12 +238,6 @@ def uplift_concentration(up: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
 
 
 def one_cycle_spread(q: pd.DataFrame) -> pd.DataFrame:
-    """A spread-based reconstruction consistent with Rystad Energy's published description of its
-    15-minute gain: a 1-hour battery cycling once a day with perfect foresight. Rystad states no
-    treatment of losses, wear or order; this assumes none of them, so charging need not come
-    before discharging. Per market and window, the mean daily 15-minute spread (mean of the
-    day's four highest quarter-hour prices minus mean of its four lowest), the mean daily hourly
-    spread (highest minus lowest hour of the hourly benchmark) and the uplift as their ratio."""
     hourly = hourly_benchmark(q)
     rows = []
     for market in ("es", "pt"):
@@ -340,14 +293,6 @@ def weather_summary(weather: pd.DataFrame) -> pd.DataFrame:
 def forecast_motivation(
     q: pd.DataFrame, hours: pd.DataFrame, daily: pd.DataFrame, wx: pd.DataFrame
 ) -> pd.DataFrame:
-    """Descriptive Pearson correlations that the forecast step will lean on. The signed deviation
-    of a quarter from its hourly mean is uncorrelated with the hourly weather by construction
-    (the deviations sum to zero within each hour, where the weather is constant), so the
-    within-hour shape is described by the hour's spread (against the weather level) and its
-    slope Q4 - Q1 (against the change in weather across the hour) instead. Temperature and wind
-    are values at the start of each hour, so their change across the hour is the next hour's
-    value minus this hour's. Radiation is the mean over each hour, so its change centred on the
-    same hour is half the difference between the next hour's mean and the previous hour's."""
     rows = []
 
     def add(quantity, against, r, n, description):
@@ -419,9 +364,6 @@ def forecast_motivation(
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------- figures
-
-
 def _style() -> None:
     plt.rcParams.update(
         {
@@ -450,7 +392,7 @@ def _style() -> None:
 
 def fig_daily(daily: pd.DataFrame) -> plt.Figure:
     x = pd.to_datetime(daily["delivery_date"].astype(str))
-    fig, (a, b) = plt.subplots(2, 1, figsize=(WIDTH, 4), sharex=True)
+    fig, (a, b) = plt.subplots(2, 1, figsize=(FIGURE_WIDTH_INCHES, 4), sharex=True)
     a.plot(x, daily["mean_price"], color=SERIES[0])
     a.set_ylabel("EUR/MWh")
     a.set_title("Daily mean Spanish day-ahead price (15-minute)")
@@ -474,27 +416,25 @@ def fig_profile(q: pd.DataFrame) -> plt.Figure:
     )
     prof = df.groupby(["season", "slot"])["price"].mean().unstack("season")
     seasons = [s for s in SEASON_ORDER if s in prof.columns]
-    # The hourly steps go on the season whose profile has the most within-hour shape.
     hourly = prof.groupby(prof.index // 4).transform("mean")
     shape = (prof - hourly).abs().mean()
-    pick = shape[seasons].idxmax()
-    fig, ax = plt.subplots(figsize=(WIDTH, 3.4))
+    season_with_most_shape = shape[seasons].idxmax()
+    fig, ax = plt.subplots(figsize=(FIGURE_WIDTH_INCHES, 3.4))
     for s in seasons:
         color = SERIES[SEASON_ORDER.index(s)]
         ax.plot(prof.index / 4 + 0.125, prof[s], color=color, label=f"{s}, 15-minute")
-    steps = prof[pick].groupby(prof.index // 4).mean()
+    steps = prof[season_with_most_shape].groupby(prof.index // 4).mean()
     ax.stairs(
         steps.to_numpy(),
         np.arange(len(steps) + 1),
         color=INK_2,
         linewidth=1.0,
-        label=f"{pick}, hourly benchmark",
+        label=f"{season_with_most_shape}, hourly benchmark",
     )
     ax.set_xlim(0, 24)
     ax.set_xticks(range(0, 25, 3))
     ax.set_xlabel("hour of day, local time (Madrid)")
     ax.set_ylabel("mean price (EUR/MWh)")
-    # Each season averages every year the sample covers it in, such as autumn 2025 and 2026.
     ax.set_title(
         "Average price by quarter-hour of day and season, all years pooled"
         f" ({dates.min():%b %Y} – {dates.max():%b %Y})"
@@ -513,7 +453,7 @@ def fig_quarter_deviation(q: pd.DataFrame) -> plt.Figure:
         }
     )
     m = df.groupby(["hour", "quarter"])["dev"].mean().unstack("quarter")
-    fig, ax = plt.subplots(figsize=(WIDTH, 3.2))
+    fig, ax = plt.subplots(figsize=(FIGURE_WIDTH_INCHES, 3.2))
     ax.axhline(0, color=AXIS, linewidth=0.8)
     for k in m.columns:
         ax.plot(m.index, m[k], color=SERIES[k - 1], marker="o", markersize=3, label=f"Q{k}")
@@ -529,7 +469,7 @@ def fig_spread_hist(hours: pd.DataFrame) -> plt.Figure:
     s = hours["spread"]
     cut = s.quantile(0.99)
     beyond = (s > cut).mean()
-    fig, ax = plt.subplots(figsize=(WIDTH, 3))
+    fig, ax = plt.subplots(figsize=(FIGURE_WIDTH_INCHES, 3))
     ax.hist(s[s <= cut], bins=60, color=SERIES[0], edgecolor="white", linewidth=0.4)
     ax.set_xlim(0, cut)
     ax.set_xlabel("within-hour spread, max − min of the four quarter-hours (EUR/MWh)")
@@ -551,7 +491,7 @@ def fig_spread_hist(hours: pd.DataFrame) -> plt.Figure:
 
 def fig_uplift_month(by_month: pd.DataFrame) -> plt.Figure:
     months = sorted(by_month["month"].unique())
-    fig, ax = plt.subplots(figsize=(WIDTH, 3.2))
+    fig, ax = plt.subplots(figsize=(FIGURE_WIDTH_INCHES, 3.2))
     for i, d in enumerate(DURATIONS_H):
         g = by_month[by_month["duration_h"] == d].set_index("month").reindex(months)
         ax.plot(
@@ -562,7 +502,6 @@ def fig_uplift_month(by_month: pd.DataFrame) -> plt.Figure:
             markersize=3,
             label=f"{d} h",
         )
-    # A month the sample covers only in part is labelled with its number of days.
     days = by_month.groupby("month")["days"].max()
     labels = [m if days[m] == pd.Period(m).days_in_month else f"{m} ({days[m]} d)" for m in months]
     ax.set_xticks(range(len(months)), labels, rotation=45, ha="right")
@@ -574,7 +513,9 @@ def fig_uplift_month(by_month: pd.DataFrame) -> plt.Figure:
 
 def fig_uplift_scatter(up: pd.DataFrame, daily: pd.DataFrame) -> plt.Figure:
     d = daily.set_index("delivery_date")["mean_spread"]
-    fig, axes = plt.subplots(1, len(DURATIONS_H), figsize=(WIDTH, 2.8), sharex=True, sharey=True)
+    fig, axes = plt.subplots(
+        1, len(DURATIONS_H), figsize=(FIGURE_WIDTH_INCHES, 2.8), sharex=True, sharey=True
+    )
     for i, (ax, dur) in enumerate(zip(axes, DURATIONS_H, strict=True)):
         g = up[up["duration_h"] == dur]
         ax.scatter(
@@ -592,7 +533,7 @@ def fig_uplift_scatter(up: pd.DataFrame, daily: pd.DataFrame) -> plt.Figure:
 
 
 def fig_sensitivity(s: pd.DataFrame) -> plt.Figure:
-    fig, (a, b) = plt.subplots(1, 2, figsize=(WIDTH, 2.8), sharex=True)
+    fig, (a, b) = plt.subplots(1, 2, figsize=(FIGURE_WIDTH_INCHES, 2.8), sharex=True)
     for i, d in enumerate(DURATIONS_H):
         g = s[s["duration_h"] == d].sort_values("cost_eur_per_mwh")
         kw = {"color": SERIES[i], "marker": "o", "markersize": 3, "label": f"{d} h"}
@@ -611,7 +552,9 @@ def fig_sensitivity(s: pd.DataFrame) -> plt.Figure:
 
 def fig_price_weather(q: pd.DataFrame, wx: pd.DataFrame) -> plt.Figure:
     w = wx.reindex(q["delivery_start_utc"].dt.floor("h"))
-    fig, axes = plt.subplots(1, 2, figsize=(WIDTH, 2.9), sharey=True, layout="constrained")
+    fig, axes = plt.subplots(
+        1, 2, figsize=(FIGURE_WIDTH_INCHES, 2.9), sharey=True, layout="constrained"
+    )
     bins = []
     for ax, var in zip(axes, ("shortwave_radiation", "wind_speed_100m"), strict=True):
         hb = ax.hexbin(
@@ -626,17 +569,13 @@ def fig_price_weather(q: pd.DataFrame, wx: pd.DataFrame) -> plt.Figure:
         ax.set_xlabel(f"national mean {WEATHER_LABELS[var]}")
         ax.grid(False)
         bins.append(hb)
-    # One colour scale for both panels, so the same shade means the same count.
-    norm = matplotlib.colors.LogNorm(1, max(b.get_array().max() for b in bins))
+    shared_count_scale = matplotlib.colors.LogNorm(1, max(b.get_array().max() for b in bins))
     for b in bins:
-        b.set_norm(norm)
+        b.set_norm(shared_count_scale)
     fig.colorbar(bins[0], ax=axes, label="quarter-hours (log scale)")
     axes[0].set_ylabel("15-minute price (EUR/MWh)")
     fig.suptitle("Price against the forecast weather of its hour (descriptive)")
     return fig
-
-
-# ---------------------------------------------------------------- run
 
 
 def _input(path: Path, time_col: str) -> tuple[pd.DataFrame, dict]:
@@ -647,11 +586,6 @@ def _input(path: Path, time_col: str) -> tuple[pd.DataFrame, dict]:
 
 
 def run(data_dir: Path) -> dict:
-    """Read the dataset and the perfect-foresight results, write every table and figure to
-    ``data_dir/results/eda`` and return the meta record. Every input is checked and every output
-    built before anything is written, and the outputs replace the previous set all together or
-    not at all (``battery._write_all``). Raises BuildError if an input is missing or lacks a
-    column or an hour the outputs need."""
     started = time.perf_counter()
     ds, res = data_dir / "dataset", data_dir / "results"
     required = {
@@ -724,7 +658,6 @@ def run(data_dir: Path) -> dict:
         if fig.get_layout_engine() is None:
             fig.tight_layout()
         for ext in ("png", "pdf"):
-            # The writer gets a .part path, so the format is given rather than read from it.
             files[out / f"{name}.{ext}"] = lambda t, f=fig, e=ext: f.savefig(t, format=e, dpi=DPI)
     status = _git("status", "--porcelain")
     meta = {
@@ -737,7 +670,6 @@ def run(data_dir: Path) -> dict:
     }
 
     def write_meta(t: Path) -> None:
-        # The meta is written last, so its time includes drawing every figure.
         meta["seconds"] = round(time.perf_counter() - started, 1)
         t.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
@@ -749,7 +681,6 @@ def run(data_dir: Path) -> dict:
         for fig in figures.values():
             plt.close(fig)
     if sens is None:
-        # A figure G from an earlier run, or a part of one, does not match the new outputs.
         for p in out.glob("fig_g_*"):
             p.unlink()
     return meta

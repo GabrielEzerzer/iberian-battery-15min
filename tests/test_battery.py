@@ -42,7 +42,6 @@ TOL = 1e-6
 
 
 def random_day(rng, n=96):
-    """Quarter-hour prices with a daily shape, noise and some negative and zero prices."""
     t = np.arange(n)
     shape = 60 + 40 * np.sin(2 * np.pi * t / n) - 50 * np.exp(-(((t - n / 2) / (n / 8)) ** 2))
     p = shape + rng.normal(0, 25, n)
@@ -55,19 +54,28 @@ def hourly(p):
 
 
 def simulate(c, d, dt, energy):
-    """End-of-period energy for a schedule, starting at SOC_START of capacity."""
     return SOC_START * energy + np.cumsum(ETA * c * dt - d * dt / ETA)
 
 
-def test_two_quarter_hours_hand_solved():
-    # A 0.1 MWh battery holds 0.05 MWh at the start; power never binds (0.25 MWh a quarter).
-    # Optimal: fill it at 0, then empty it back to 0.05 MWh at 100.
+def test_two_quarter_hours_hand_solved_fill_at_0_then_empty_back_to_the_start_at_100():
     energy = 0.1
     r = solve_day([0.0, 100.0], DT_15MIN, energy, MAIN)
     stored = energy - SOC_START * energy
-    np.testing.assert_allclose(r.charge, [stored / (ETA * DT_15MIN), 0], atol=1e-9)
-    np.testing.assert_allclose(r.discharge, [0, stored * ETA / DT_15MIN], atol=1e-9)
-    np.testing.assert_allclose(r.energy, [energy, SOC_START * energy], atol=1e-9)
+    power_never_binds = (
+        "a 0.1 MWh battery starts with 0.05 MWh; power never binds (0.25 MWh a quarter)"
+    )
+    np.testing.assert_allclose(
+        r.charge, [stored / (ETA * DT_15MIN), 0], atol=1e-9, err_msg=power_never_binds
+    )
+    np.testing.assert_allclose(
+        r.discharge, [0, stored * ETA / DT_15MIN], atol=1e-9, err_msg=power_never_binds
+    )
+    np.testing.assert_allclose(
+        r.energy,
+        [energy, SOC_START * energy],
+        atol=1e-9,
+        err_msg="full at 0, back to 0.05 MWh at 100",
+    )
     assert r.discharged_mwh == pytest.approx(stored * ETA)
     assert r.gross == pytest.approx(100 * stored * ETA)
     assert r.degradation == pytest.approx(20 * stored * ETA)
@@ -81,10 +89,14 @@ def test_flat_prices_give_no_dispatch_in_main():
     assert r.gross == pytest.approx(0, abs=TOL) and r.net == pytest.approx(0, abs=TOL)
 
 
-@pytest.mark.parametrize("sell, trades", [(76.0, False), (78.0, True)])
+@pytest.mark.parametrize(
+    "sell, trades",
+    [
+        pytest.param(76.0, False, id="buy-50-costs-56.8-sold-spread-19.2-below-cost-20"),
+        pytest.param(78.0, True, id="buy-50-costs-56.8-sold-spread-21.2-above-cost-20"),
+    ],
+)
 def test_degradation_cost_blocks_a_cycle_below_20_net_of_losses(sell, trades):
-    # Buying at 50 costs 50 / RTE = 56.8 per MWh sold, so the spread net of losses is
-    # sell - 56.8: 19.2 at 76 (below the 20 cost), 21.2 at 78 (above it).
     r = solve_day([50.0, sell], DT_15MIN, 0.1, MAIN)
     assert (r.discharged_mwh > TOL) == trades
     assert (r.net > TOL) == trades
@@ -103,8 +115,12 @@ def test_bounds_on_a_random_day(spec, hours):
             assert x.min() >= -TOL and x.max() <= POWER_MW + TOL
         assert r.energy.min() >= -TOL and r.energy.max() <= energy + TOL
         assert r.energy[-1] == pytest.approx(SOC_START * energy, abs=TOL)
-        # The reported energy path is the one the dynamics give for the reported powers.
-        np.testing.assert_allclose(r.energy, simulate(r.charge, r.discharge, dt, energy), atol=TOL)
+        np.testing.assert_allclose(
+            r.energy,
+            simulate(r.charge, r.discharge, dt, energy),
+            atol=TOL,
+            err_msg="the reported energy path is the one the dynamics give for the reported powers",
+        )
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=lambda s: s.name)
@@ -117,21 +133,25 @@ def test_hourly_schedule_is_constant_within_each_hour_and_feasible_at_15min(spec
     for x in (c, d):
         assert (x.reshape(-1, 4) == x.reshape(-1, 4)[:, :1]).all()
     assert np.abs(c[::4] - r.charge).max() == 0 and np.abs(d[::4] - r.discharge).max() == 0
-    # Played at 15 minutes against the quarter-hour prices, it stays feasible and earns the same.
+    played_at_15min = "played at 15 minutes against the quarter-hour prices, it stays feasible"
     s = simulate(c, d, DT_15MIN, energy)
-    assert s.min() >= -TOL and s.max() <= energy + TOL
-    assert s[-1] == pytest.approx(SOC_START * energy, abs=TOL)
-    assert np.sum(p * (d - c)) * DT_15MIN == pytest.approx(r.gross, abs=TOL)
+    assert s.min() >= -TOL and s.max() <= energy + TOL, played_at_15min
+    assert s[-1] == pytest.approx(SOC_START * energy, abs=TOL), played_at_15min
+    assert np.sum(p * (d - c)) * DT_15MIN == pytest.approx(r.gross, abs=TOL), (
+        "played at 15 minutes against the quarter-hour prices, it earns the same"
+    )
 
 
 def price_days():
     rng = np.random.default_rng(2025)
     days = [random_day(rng) for _ in range(25)]
-    days += [random_day(rng, n) for n in (92, 96, 100)]  # DST-length days
-    days.append(rng.uniform(-30, 200, 96).round(2))  # no shape, wide spread
-    # Nearly flat within each hour, so the 15-minute gain is small, as on most real days.
-    days += [np.repeat(hourly(d), 4) + rng.normal(0, 0.5, len(d)) for d in days[:10]]
-    return days
+    dst_length_days = [random_day(rng, n) for n in (92, 96, 100)]
+    no_shape_wide_spread = rng.uniform(-30, 200, 96).round(2)
+    days += dst_length_days + [no_shape_wide_spread]
+    nearly_flat_within_each_hour_small_15min_gain_as_on_most_real_days = [
+        np.repeat(hourly(d), 4) + rng.normal(0, 0.5, len(d)) for d in days[:10]
+    ]
+    return days + nearly_flat_within_each_hour_small_15min_gain_as_on_most_real_days
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=lambda s: s.name)
@@ -156,8 +176,10 @@ def test_15min_equals_hourly_when_prices_are_flat_within_each_hour(spec, n):
 
 @pytest.mark.parametrize("hours", DURATIONS_H)
 def test_cap2_limits_discharge_to_two_cycles(hours):
-    # Prices alternating every two hours would pay for about six cycles a day uncapped.
-    p = np.tile(np.repeat([10.0, 150.0], 8), 6)
+    alternating_every_two_hours_about_six_cycles_a_day_uncapped = np.tile(
+        np.repeat([10.0, 150.0], 8), 6
+    )
+    p = alternating_every_two_hours_about_six_cycles_a_day_uncapped
     energy = POWER_MW * hours
     for prices, dt in ((p, DT_15MIN), (hourly(p), DT_HOURLY)):
         assert solve_day(prices, dt, energy, NO_COST).discharged_mwh > 2 * energy + 0.1
@@ -166,18 +188,19 @@ def test_cap2_limits_discharge_to_two_cycles(hours):
 
 @pytest.mark.parametrize("hours", DURATIONS_H)
 def test_charge_plus_discharge_stays_within_power_at_negative_prices(hours):
-    # At a flat -100 the battery is paid to import, so it burns energy in the losses by charging
-    # and discharging at once, keeping sum(d) = RTE * sum(c) to end the day where it started.
-    # Without the shared limit, c = 1 and d = RTE in every period earns 100 * (1 - RTE) EUR an
-    # hour; with c + d <= 1 the best is sum(c) = periods / (1 + RTE), which earns less.
     energy = POWER_MW * hours
     for n, dt in ((96, DT_15MIN), (24, DT_HOURLY)):
         r = solve_day(np.full(n, -100.0), dt, energy, NO_COST)
         assert (r.charge + r.discharge).max() <= POWER_MW + 1e-9
-        unconstrained = 100 * (1 - RTE) * n * dt
-        shared = unconstrained / (1 + RTE)
-        assert r.net == pytest.approx(shared, abs=TOL)
-        assert r.net < unconstrained - 1
+        unconstrained_charge_1_discharge_rte_every_period = 100 * (1 - RTE) * n * dt
+        shared_limit_best_charges_periods_over_1_plus_rte = (
+            unconstrained_charge_1_discharge_rte_every_period / (1 + RTE)
+        )
+        assert r.net == pytest.approx(shared_limit_best_charges_periods_over_1_plus_rte, abs=TOL)
+        assert r.net < unconstrained_charge_1_discharge_rte_every_period - 1, (
+            "at -100 the battery burns energy by charging and discharging at once, keeping "
+            "sum(d) = RTE * sum(c); without the shared limit it would earn 100 * (1 - RTE) an hour"
+        )
         assert r.simultaneous > 0
 
 
@@ -189,25 +212,33 @@ def test_charge_plus_discharge_stays_within_power_at_negative_prices(hours):
         (4, 388.65213169650485, 174.91324627777712),
     ],
 )
-def test_main_value_is_unchanged_by_the_shared_power_limit(hours, net15, neth):
-    # Values from the model before c + d <= POWER_MW was added. On these days main never
-    # charges and discharges in the same period, so the limit cannot bind.
+def test_main_values_from_before_the_shared_power_limit_still_hold_as_it_never_binds(
+    hours, net15, neth
+):
     p = random_day(np.random.default_rng(hours))
     for prices, dt, expected in ((p, DT_15MIN, net15), (hourly(p), DT_HOURLY, neth)):
         r = solve_day(prices, dt, hours, MAIN)
-        assert r.net == pytest.approx(expected, rel=1e-7)
-        assert r.simultaneous == 0
+        assert r.net == pytest.approx(expected, rel=1e-7), (
+            "values from the model before c + d <= POWER_MW was added"
+        )
+        assert r.simultaneous == 0, (
+            "on these days main never charges and discharges in the same period, so the limit "
+            "cannot bind"
+        )
 
 
 def test_solver_failure_raises():
-    impossible = Spec("negative_cap", 0.0, -1.0)  # discharge cannot be below zero MWh
+    discharge_cannot_be_below_zero_mwh = Spec("negative_cap", 0.0, -1.0)
     with pytest.raises(SolveError, match="status"):
-        solve_day(random_day(np.random.default_rng(0)), DT_15MIN, 1.0, impossible)
+        solve_day(
+            random_day(np.random.default_rng(0)),
+            DT_15MIN,
+            1.0,
+            discharge_cannot_be_below_zero_mwh,
+        )
 
 
 def price_tables(days, pt_days=None):
-    """15-minute and hourly price tables, as the dataset stores them, for a list of price days
-    starting on 2025-10-01. The Portuguese prices are ``pt_days``, or the Spanish ones."""
     rows = []
     for i, (prices, pt) in enumerate(zip(days, pt_days or days, strict=True)):
         day = date(2025, 10, 1) + timedelta(days=i)
@@ -231,7 +262,6 @@ def price_tables(days, pt_days=None):
 
 
 def dataset_dir(tmp_path, ndays=3):
-    """A data dir with a tiny price dataset: ndays 96-period days and one 100-period day."""
     rng = np.random.default_rng(1)
     q, h = price_tables([random_day(rng, 100 if i == ndays else 96) for i in range(ndays + 1)])
     ds = tmp_path / "dataset"
@@ -247,20 +277,22 @@ def test_cli_writes_daily_summary_and_meta(tmp_path):
     out = data_dir / "results"
     assert sorted(p.name for p in out.iterdir()) == RESULT_FILES
     daily = pd.read_parquet(out / "perfect_foresight_daily.parquet")
-    # SPECS plus the sensitivity costs no spec already has (10, 30, 40 EUR/MWh).
-    assert len(daily) == 4 * len(DURATIONS_H) * (len(SPECS) + 3) * 2
-    # Each resolution is solved at its own period length: the 15-minute value is never below
-    # the hourly one, and a day matches a direct solve of its 15-minute prices.
+    sensitivity_costs_no_spec_already_has_10_30_40_eur_per_mwh = 3
+    specs_in_daily = len(SPECS) + sensitivity_costs_no_spec_already_has_10_30_40_eur_per_mwh
+    assert len(daily) == 4 * len(DURATIONS_H) * specs_in_daily * 2
     wide = daily.pivot_table(
         index=["delivery_date", "duration_h", "spec"], columns="resolution", values="net_eur_per_mw"
     )
-    assert len(wide) == 4 * len(DURATIONS_H) * (len(SPECS) + 3)
-    assert (wide["15min"] >= wide["hourly"] - 1e-6).all()
+    assert len(wide) == 4 * len(DURATIONS_H) * specs_in_daily
+    assert (wide["15min"] >= wide["hourly"] - 1e-6).all(), (
+        "each resolution is solved at its own period length: the 15-minute value is never below "
+        "the hourly one"
+    )
     q = pd.read_parquet(data_dir / "dataset" / "prices_15min.parquet")
     first = q[q["delivery_date"] == date(2025, 10, 1)].sort_values("period")["price_es"]
     assert wide.loc[(date(2025, 10, 1), 2, "main"), "15min"] == pytest.approx(
         solve_day(first.to_numpy(), DT_15MIN, 2.0, MAIN).net, rel=1e-9
-    )
+    ), "a day matches a direct solve of its 15-minute prices"
     main_rows = daily[daily["spec"] == "main"]
     assert np.allclose(
         main_rows["net_eur_per_mw"],
@@ -282,8 +314,9 @@ def test_cli_writes_daily_summary_and_meta(tmp_path):
     assert meta["date_range"] == {"start": "2025-10-01", "end": "2025-10-04"}
     assert meta["days"] == 4 and meta["round_trip_efficiency"] == 0.88
     assert meta["cost_sensitivity_eur_per_mwh_discharged"] == [0.0, 10.0, 20.0, 30.0, 40.0]
-    # Every spec in the daily file, the sensitivity's cost_* ones included, is described in meta.
-    assert set(meta["specs"]) == set(daily["spec"])
+    assert set(meta["specs"]) == set(daily["spec"]), (
+        "every spec in the daily file, the sensitivity's cost_* ones included, is described in meta"
+    )
     assert meta["specs"]["cost_10"] == {
         "cost_eur_per_mwh_discharged": 10.0,
         "max_cycles_per_day": None,
@@ -305,7 +338,6 @@ RESULT_FILES = [
 
 
 def previous_results(out):
-    """Result files with contents of their own, as a previous run left them; returns the bytes."""
     out.mkdir(exist_ok=True)
     for name in RESULT_FILES:
         (out / name).write_text(f"previous {name}")
@@ -324,16 +356,18 @@ def test_a_failed_write_leaves_the_previous_results_intact(tmp_path, monkeypatch
     def fail(*args, **kwargs):
         raise OSError("disk full")
 
-    # The daily parquet is written first, then the CSVs fail.
     monkeypatch.setattr(pd.DataFrame, "to_csv", fail)
     with pytest.raises(OSError, match="disk full"):
         main(["perfect-foresight", "--data-dir", str(data_dir)])
-    assert files_in(out) == previous  # the daily .part is removed too
+    assert files_in(out) == previous, (
+        "the daily parquet is written first, then the CSVs fail; the daily .part is removed too"
+    )
 
-    # The next run leaves only the results.
     monkeypatch.undo()
     assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
-    assert sorted(p.name for p in out.iterdir()) == RESULT_FILES
+    assert sorted(p.name for p in out.iterdir()) == RESULT_FILES, (
+        "the next run leaves only the results"
+    )
     assert len(pd.read_parquet(out / "perfect_foresight_daily.parquet")) > 0
 
 
@@ -341,8 +375,6 @@ def test_a_failed_write_leaves_the_previous_results_intact(tmp_path, monkeypatch
 def test_a_file_that_cannot_be_replaced_leaves_the_previous_results(
     tmp_path, monkeypatch, capsys, locked
 ):
-    # On Windows a file another program holds open (a CSV open in Excel) can be neither renamed
-    # nor replaced. Here every rename to or from the locked file fails the same way, on any OS.
     data_dir = dataset_dir(tmp_path, ndays=1)
     out = data_dir / "results"
     previous = previous_results(out)
@@ -354,9 +386,13 @@ def test_a_file_that_cannot_be_replaced_leaves_the_previous_results(
         return replace(self, target)
 
     monkeypatch.setattr(Path, "replace", locked_replace)
-    assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1
+    assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1, (
+        "on Windows a file another program holds open (a CSV open in Excel) can be neither "
+        "renamed nor replaced; here every rename to or from the locked file fails the same way, "
+        "on any OS"
+    )
     assert f"cannot replace {out / locked}" in capsys.readouterr().err
-    assert files_in(out) == previous  # byte for byte, and no .part or .prev left
+    assert files_in(out) == previous, "byte for byte, and no .part or .prev left"
 
 
 @pytest.mark.skipif(
@@ -368,20 +404,19 @@ def test_a_results_file_open_in_another_program_leaves_the_previous_results(tmp_
     out = data_dir / "results"
     previous = previous_results(out)
     summary = out / "perfect_foresight_summary.csv"
-    # Python's open() on Windows does not let others delete or rename the file, as Excel does.
     with open(summary):
-        assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1
+        assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1, (
+            "Python's open() on Windows blocks rename and delete the way Excel does"
+        )
     assert f"cannot replace {summary}" in capsys.readouterr().err
     assert files_in(out) == previous
-    # Once the file is closed, the next run replaces the whole set.
     assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
     assert sorted(p.name for p in out.iterdir()) == RESULT_FILES
-    assert summary.read_bytes() != previous[summary.name]
+    assert summary.read_bytes() != previous[summary.name], (
+        "once the file is closed, the next run replaces the whole set"
+    )
 
 
-# What a run killed at each step leaves behind, for two files written in the order a, b, and
-# which set a later run that fails should leave in place: the files from before the killed run,
-# unless that run had put all its new files in place.
 KILLED = {
     "while writing the parts": ({"a": "old a", "b": "old b", "a.part": "half"}, "old"),
     "while moving the old files aside": (
@@ -396,8 +431,10 @@ KILLED = {
 }
 
 
-@pytest.mark.parametrize("leftovers, kept", KILLED.values(), ids=KILLED.keys())
-def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(tmp_path, leftovers, kept):
+@pytest.mark.parametrize("leftovers, later_failure_keeps", KILLED.values(), ids=KILLED.keys())
+def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(
+    tmp_path, leftovers, later_failure_keeps
+):
     a, b = tmp_path / "a", tmp_path / "b"
 
     def leave(files):
@@ -415,7 +452,13 @@ def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(tmp_path
     leave(leftovers)
     with pytest.raises(OSError, match="disk full"):
         _write_all({a: write("newest a"), b: fail})
-    assert files_in(tmp_path) == {"a": f"{kept} a".encode(), "b": f"{kept} b".encode()}
+    assert files_in(tmp_path) == {
+        "a": f"{later_failure_keeps} a".encode(),
+        "b": f"{later_failure_keeps} b".encode(),
+    }, (
+        "for a and b written in that order, a later run that fails leaves the files from before "
+        "the killed run (old), unless that run had put all its new files in place (new)"
+    )
 
     leave(leftovers)
     _write_all({a: write("newest a"), b: write("newest b")})
@@ -423,7 +466,6 @@ def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(tmp_path
 
 
 def test_a_failed_rename_removes_a_new_file_with_no_previous_version(tmp_path, monkeypatch):
-    # b is new (no previous version) and goes in first; then putting a in place fails.
     a, b = tmp_path / "a", tmp_path / "b"
     a.write_text("old a")
     real_replace = Path.replace
@@ -436,14 +478,17 @@ def test_a_failed_rename_removes_a_new_file_with_no_previous_version(tmp_path, m
     monkeypatch.setattr(Path, "replace", replace)
     with pytest.raises(OSError, match="rename failed"):
         _write_all({b: lambda t: t.write_text("new b"), a: lambda t: t.write_text("new a")})
-    assert files_in(tmp_path) == {"a": b"old a"}
+    assert files_in(tmp_path) == {"a": b"old a"}, (
+        "b is new (no previous version) and goes in first; then putting a in place fails"
+    )
 
 
 @pytest.fixture(scope="module")
 def sensitivity_daily():
     rng = np.random.default_rng(11)
     days = [random_day(rng) for _ in range(3)] + [random_day(rng, 92)]
-    days.append(np.tile(np.repeat([10.0, 150.0], 8), 6))  # pays for many cycles a day
+    pays_for_many_cycles_a_day = np.tile(np.repeat([10.0, 150.0], 8), 6)
+    days.append(pays_for_many_cycles_a_day)
     return daily_values(*price_tables(days))
 
 
@@ -469,8 +514,9 @@ def test_net_value_and_cycles_fall_as_the_wear_cost_rises(sensitivity_daily, res
         assert list(g["cost_eur_per_mwh"]) == list(SENSITIVITY_COSTS)
         for column in (net, cycles):
             assert (np.diff(g[column].to_numpy()) <= 1e-9).all(), (hours, column)
-        # Strictly lower from the first cost to the last, so the costs are applied at all.
-        assert g[net].iloc[-1] < g[net].iloc[0] and g[cycles].iloc[-1] < g[cycles].iloc[0]
+        assert g[net].iloc[-1] < g[net].iloc[0] and g[cycles].iloc[-1] < g[cycles].iloc[0], (
+            "strictly lower from the first cost to the last, so the costs are applied at all"
+        )
 
 
 def test_15min_net_is_at_least_hourly_at_every_cost(sensitivity_daily):
@@ -480,18 +526,20 @@ def test_15min_net_is_at_least_hourly_at_every_cost(sensitivity_daily):
 
 
 def test_percent_uplift_is_nan_when_the_hourly_total_is_zero():
-    # Each hour alternates 0 and 100 by quarter-hour: the hourly price is a flat 50, so the
-    # hourly value is zero, while the 15-minute prices pay for cycling.
-    daily = daily_values(*price_tables([np.tile([0.0, 100.0], 48)]))
+    each_hour_alternates_0_and_100_by_quarter_hour = np.tile([0.0, 100.0], 48)
+    daily = daily_values(*price_tables([each_hour_alternates_0_and_100_by_quarter_hour]))
     summary = summarise(daily)
-    assert (summary["net_hourly_keur_per_mw"] == 0).all()
-    assert (summary["net_15min_keur_per_mw"] > 0).all()
+    assert (summary["net_hourly_keur_per_mw"] == 0).all(), (
+        "the hourly price is a flat 50, so the hourly value is zero"
+    )
+    assert (summary["net_15min_keur_per_mw"] > 0).all(), "the 15-minute prices pay for cycling"
     assert summary["net_uplift_pct"].map(math.isnan).all()
     assert summary["gross_uplift_pct"].map(math.isnan).all()
-    # Solver noise around zero counts as zero rather than giving a huge percentage.
     daily.loc[daily["resolution"] == "hourly", ["net_eur_per_mw", "gross_eur_per_mw"]] += 1e-9
     noisy = summarise(daily)
-    assert noisy["net_uplift_pct"].map(math.isnan).all()
+    assert noisy["net_uplift_pct"].map(math.isnan).all(), (
+        "solver noise around zero counts as zero rather than giving a huge percentage"
+    )
     assert noisy["gross_uplift_pct"].map(math.isnan).all()
 
 
@@ -506,9 +554,6 @@ def test_hourly_prices_that_are_not_the_mean_are_rejected(tmp_path, capsys):
     assert not (data_dir / "results").exists()
 
 
-# ---------------------------------------------------------------- uncertainty
-
-
 def test_the_bootstrap_is_reproducible_with_the_seed():
     a = bootstrap_days(30, resamples=50)
     assert np.array_equal(a, bootstrap_days(30, resamples=50))
@@ -520,13 +565,16 @@ def test_bootstrap_blocks_are_contiguous_and_wrap_around():
     n, block = 10, 7
     idx = bootstrap_days(n, block=block, resamples=500)
     assert idx.min() >= 0 and idx.max() < n
-    # Each row is a block of 7 days and the first 3 of a second block, each running on by one
-    # day and from the last day (9) back to the first (0).
     for start, length in ((0, block), (block, n - block)):
         b = idx[:, start : start + length]
-        assert (np.diff(b, axis=1) % n == 1).all()
-    first = idx[:, :block]  # some first block runs from day 9 on to day 0
-    assert ((first[:, :-1] == n - 1) & (first[:, 1:] == 0)).any()
+        assert (np.diff(b, axis=1) % n == 1).all(), (
+            "each row is a block of 7 days and the first 3 of a second block, each running on by "
+            "one day and from the last day (9) back to the first (0)"
+        )
+    first = idx[:, :block]
+    assert ((first[:, :-1] == n - 1) & (first[:, 1:] == 0)).any(), (
+        "some first block runs from day 9 on to day 0"
+    )
 
 
 @pytest.mark.parametrize("n", [1, 6, 7, 10, 404])
@@ -535,8 +583,6 @@ def test_every_resample_has_as_many_days_as_the_sample(n):
 
 
 def pf_daily(v15, vh) -> pd.DataFrame:
-    """A perfect_foresight_daily frame with the given net values a day (15 minutes and hourly),
-    the same for every duration and spec."""
     days = [date(2025, 10, 1) + timedelta(days=i) for i in range(len(v15))]
     rows = [
         {
@@ -572,13 +618,16 @@ def test_uncertainty_estimates_are_the_summary_values(tmp_path):
         assert r["days"] == 4
     meta = json.loads((out / "perfect_foresight_meta.json").read_text())
     assert meta["uncertainty"]["block_days"] == 7 and meta["uncertainty"]["resamples"] == 10_000
-    # The resampled statistic, on the original days, is the summary value.
     daily = pd.read_parquet(out / "perfect_foresight_daily.parquet")
     same = np.arange(4)[None]
     for _, row in summary.iterrows():
         stats = uplift_statistics(daily, row["duration_h"], row["spec"], same)
         for name in UNCERTAINTY_STATS:
-            assert stats[name][0] == pytest.approx(row[name], rel=1e-9), (row["spec"], name)
+            assert stats[name][0] == pytest.approx(row[name], rel=1e-9), (
+                "the resampled statistic, on the original days, is the summary value",
+                row["spec"],
+                name,
+            )
 
 
 def test_the_interval_collapses_when_every_day_is_the_same():
@@ -586,31 +635,27 @@ def test_the_interval_collapses_when_every_day_is_the_same():
     unc = uncertainty(daily, summarise(daily))
     assert np.allclose(unc["ci_low"], unc["estimate"], rtol=1e-12, atol=0)
     assert np.allclose(unc["ci_high"], unc["estimate"], rtol=1e-12, atol=0)
-    # 30 EUR/MW a day, 25% of the hourly value.
     assert unc.groupby("statistic")["estimate"].first().round(9).to_dict() == {
         "net_uplift_eur_per_mw_day": 30.0,
         "net_uplift_pct": 25.0,
-    }
+    }, "150 against 120: 30 EUR/MW a day, 25% of the hourly value"
 
 
 def test_the_interval_matches_the_normal_one_for_independent_days():
-    # Independent daily uplifts with sd 20 over 1000 days: the mean's 95% interval is about
-    # +-1.96 * 20 / sqrt(1000) = +-1.24 EUR/MW a day around the sample mean.
     n = 1000
     u = np.random.default_rng(3).normal(50, 20, n)
     daily = pf_daily(100 + u, np.full(n, 100.0))
     stats = uplift_statistics(daily, 1, "main", bootstrap_days(n))
     lo, hi = interval(stats["net_uplift_eur_per_mw_day"])
     half = 1.96 * u.std(ddof=1) / math.sqrt(n)
-    assert (hi - lo) / 2 == pytest.approx(half, rel=0.15)
+    assert (hi - lo) / 2 == pytest.approx(half, rel=0.15), (
+        "sd 20 over 1000 independent days: half-width about 1.96 * 20 / sqrt(1000) = 1.24"
+    )
     assert (hi + lo) / 2 == pytest.approx(u.mean(), abs=0.15 * half)
 
 
 def test_an_undefined_statistic_has_no_bounds():
     assert all(math.isnan(x) for x in interval([1.0, math.nan, 2.0]))
-
-
-# ---------------------------------------------------------------- Portugal
 
 
 def portugal_table(days, pt_days):
@@ -631,62 +676,71 @@ def test_portugal_rows_equal_the_spanish_ones_when_the_prices_are_equal(tmp_path
     es, pt_rows = pt[pt["market"] == "es"], pt[pt["market"] == "pt"]
     main_rows = summary[summary["spec"] == "main"]
     shared = [c for c in summary.columns if c != "spec"]
-    # The es rows are the summary's main rows, and the pt rows (same prices) are the same.
     for rows in (es, pt_rows):
-        assert rows[shared].reset_index(drop=True).equals(main_rows[shared].reset_index(drop=True))
-    # The intervals are the uncertainty file's main intervals, on the same resampled days.
+        assert (
+            rows[shared].reset_index(drop=True).equals(main_rows[shared].reset_index(drop=True))
+        ), "the es rows are the summary's main rows, and the pt rows (same prices) are the same"
+    same_resampled_days = (
+        "the intervals are the uncertainty file's main intervals, on the same resampled days"
+    )
     for name in UNCERTAINTY_STATS:
         u = unc[(unc["spec"] == "main") & (unc["statistic"] == name)]
         for rows in (es, pt_rows):
-            assert list(rows[f"{name}_ci_low"]) == list(u["ci_low"])
-            assert list(rows[f"{name}_ci_high"]) == list(u["ci_high"])
+            assert list(rows[f"{name}_ci_low"]) == list(u["ci_low"]), same_resampled_days
+            assert list(rows[f"{name}_ci_high"]) == list(u["ci_high"]), same_resampled_days
 
 
 def test_portugal_rows_follow_the_portuguese_price():
-    # Spain is flat at 50 within each hour; Portugal alternates 0 and 100 by quarter-hour around
-    # the same hourly mean on the second day. Spain gains nothing from 15 minutes, Portugal does.
     rng = np.random.default_rng(5)
     hourly_shape = np.repeat(np.round(rng.uniform(20, 120, 24), 2), 4)
-    flat = np.repeat(50.0, 96)
-    days = [hourly_shape, flat]
-    pt_days = [hourly_shape, flat + np.tile([-50.0, 50.0], 48)]
+    spain_flat_at_50_within_each_hour = np.repeat(50.0, 96)
+    portugal_alternates_0_and_100_around_the_same_hourly_mean = (
+        spain_flat_at_50_within_each_hour + np.tile([-50.0, 50.0], 48)
+    )
+    days = [hourly_shape, spain_flat_at_50_within_each_hour]
+    pt_days = [hourly_shape, portugal_alternates_0_and_100_around_the_same_hourly_mean]
     t = portugal_table(days, pt_days).set_index(["duration_h", "market"])
     for hours in DURATIONS_H:
         es, pt = t.loc[(hours, "es")], t.loc[(hours, "pt")]
-        assert es["net_uplift_eur_per_mw_day"] == pytest.approx(0, abs=1e-6)
-        assert pt["net_uplift_eur_per_mw_day"] > 1
-        # The hourly prices are the same in both markets, so is the hourly value.
-        assert pt["net_hourly_keur_per_mw"] == pytest.approx(es["net_hourly_keur_per_mw"])
-        # Portugal's 15-minute value is a direct solve of its 15-minute prices.
+        assert es["net_uplift_eur_per_mw_day"] == pytest.approx(0, abs=1e-6), (
+            "Spain gains nothing from 15 minutes"
+        )
+        assert pt["net_uplift_eur_per_mw_day"] > 1, "Portugal gains from 15 minutes"
+        assert pt["net_hourly_keur_per_mw"] == pytest.approx(es["net_hourly_keur_per_mw"]), (
+            "the hourly prices are the same in both markets, so is the hourly value"
+        )
         direct = sum(solve_day(p, DT_15MIN, hours * POWER_MW, MAIN).net for p in pt_days)
-        assert pt["net_15min_keur_per_mw"] == pytest.approx(direct / 1000, rel=1e-9)
+        assert pt["net_15min_keur_per_mw"] == pytest.approx(direct / 1000, rel=1e-9), (
+            "Portugal's 15-minute value is a direct solve of its 15-minute prices"
+        )
 
 
 def test_price_agreement_on_a_hand_computed_case():
-    # Two hours. Spain: 10, 20, 30, 40 | 50, 50, 50, 50. Portugal: 10, 20, 30, 40 | 46, 50, 58, 50.
     es = [10.0, 20.0, 30.0, 40.0, 50.0, 50.0, 50.0, 50.0]
     pt = [10.0, 20.0, 30.0, 40.0, 46.0, 50.0, 58.0, 50.0]
-    # A second day 100 EUR/MWh higher has the same spreads, so pooling the days by hour of day
-    # (spread 130 in the first hour) would show.
-    up = [[p + 100 for p in day] for day in (es, pt)]
-    q, _ = price_tables([es, up[0]], [pt, up[1]])
-    a = price_agreement(q.iloc[::-1])  # row order does not matter
+    second_day_100_higher_same_spreads = [[p + 100 for p in day] for day in (es, pt)]
+    q, _ = price_tables(
+        [es, second_day_100_higher_same_spreads[0]], [pt, second_day_100_higher_same_spreads[1]]
+    )
+    row_order_does_not_matter = q.iloc[::-1]
+    a = price_agreement(row_order_does_not_matter)
     assert a["quarter_hours"] == 16
     assert a["share_pt_equal_to_es"] == 12 / 16
     assert a["mean_abs_pt_minus_es_eur_per_mwh"] == pytest.approx(2 * (4 + 8) / 16)
-    # Spreads on each day: Spain 30 and 0, Portugal 30 and 12.
-    assert a["mean_within_hour_spread_eur_per_mwh"] == pytest.approx({"es": 15.0, "pt": 21.0})
+    assert a["mean_within_hour_spread_eur_per_mwh"] == pytest.approx({"es": 15.0, "pt": 21.0}), (
+        "spreads each day: Spain 30 and 0, Portugal 30 and 12; pooling the two days by hour of "
+        "day would give a spread of 130 in the first hour"
+    )
 
 
 def test_portugal_intervals_are_the_bootstrap_intervals_of_each_market():
-    # 30 days with different daily uplifts in the two markets, so the intervals are wide and
-    # depend on which days each resample holds.
     rng = np.random.default_rng(8)
     n = 30
-    es, pt = (
+    different_daily_uplifts_in_the_two_markets = (
         pf_daily(100 + rng.normal(10, 5, n), np.full(n, 100.0)),
         pf_daily(100 + rng.normal(8, 9, n), np.full(n, 100.0)),
     )
+    es, pt = different_daily_uplifts_in_the_two_markets
     t = portugal(es, pt).set_index(["duration_h", "market"])
     idx = bootstrap_days(n)
     for hours in DURATIONS_H:
@@ -694,6 +748,8 @@ def test_portugal_intervals_are_the_bootstrap_intervals_of_each_market():
             stats = uplift_statistics(daily, hours, "main", idx)
             for name in UNCERTAINTY_STATS:
                 lo, hi = interval(stats[name])
-                assert lo < hi
+                assert lo < hi, (
+                    "the intervals are wide and depend on which days each resample holds"
+                )
                 assert t.loc[(hours, market), f"{name}_ci_low"] == lo
                 assert t.loc[(hours, market), f"{name}_ci_high"] == hi

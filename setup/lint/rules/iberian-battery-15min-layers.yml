@@ -1,0 +1,177 @@
+id: ib15-layer-omie
+language: Python
+severity: error
+message: "ib15.omie is the bottom layer and imports no other ib15 module. Move the shared code down into ib15.omie, or do the work in the module that imports omie."
+files:
+  - src/ib15/omie.py
+rule:
+  any:
+    - kind: import_from_statement
+      regex: '^from\s+(ib15\b|\.)'
+    - kind: import_statement
+      regex: '^import\s+ib15\b'
+---
+id: ib15-layer-dataset
+language: Python
+severity: error
+message: "ib15.dataset builds the price dataset and imports only ib15.omie from ib15. Move the code it needs down into ib15.dataset or ib15.omie."
+files:
+  - src/ib15/dataset.py
+rule:
+  any:
+    - kind: import_from_statement
+      regex: '^from\s+(ib15\b|\.)'
+      not:
+        any:
+          - regex: '^from\s+(ib15)?\.omie\s+import\b'
+          - regex: '(?s)^from\s+(ib15|\.)\s+import\s+\(?\s*omie(\s+as\s+\w+)?\s*,?\s*\)?\s*$'
+    - kind: import_statement
+      regex: '^import\s+ib15\b'
+      not:
+        regex: '^import\s+ib15\.omie(\s+as\s+\w+)?(\s*,\s*ib15\.omie(\s+as\s+\w+)?)*\s*$'
+---
+id: ib15-layer-battery-weather
+language: Python
+severity: error
+message: "ib15.battery and ib15.weather import only ib15.omie and ib15.dataset from ib15, and not each other. Move the shared code down into ib15.dataset, or do the work in ib15.eda, ib15.forecast or ib15.cli."
+files:
+  - src/ib15/battery.py
+  - src/ib15/weather.py
+rule:
+  any:
+    - kind: import_from_statement
+      regex: '^from\s+(ib15\b|\.)'
+      not:
+        any:
+          - regex: '^from\s+(ib15)?\.(omie|dataset)\s+import\b'
+          - regex: '(?s)^from\s+(ib15|\.)\s+import\s+\(?\s*(omie|dataset)(\s+as\s+\w+)?(\s*,\s*(omie|dataset)(\s+as\s+\w+)?)*\s*,?\s*\)?\s*$'
+    - kind: import_statement
+      regex: '^import\s+ib15\b'
+      not:
+        regex: '^import\s+ib15\.(omie|dataset)(\s+as\s+\w+)?(\s*,\s*ib15\.(omie|dataset)(\s+as\s+\w+)?)*\s*$'
+---
+id: ib15-layer-eda
+language: Python
+severity: error
+message: "ib15.eda sits below ib15.forecast and ib15.cli and never imports them. Move the code it needs into ib15.eda or a lower module."
+files:
+  - src/ib15/eda.py
+rule:
+  any:
+    - kind: import_from_statement
+      regex: '^from\s+(ib15)?\.(forecast|cli|__main__)\b'
+    - kind: import_from_statement
+      regex: '(?s)^from\s+(ib15|\.)\s+import\b.*\b(forecast|cli|__main__)\b'
+    - kind: import_statement
+      regex: '^import\s+ib15\.(forecast|cli|__main__)\b'
+---
+id: ib15-library-imports-no-cli
+language: Python
+severity: error
+message: "Library modules never import the command line (ib15.cli, ib15.__main__). Return values to the CLI and let it print and parse arguments."
+files:
+  - src/**/*.py
+ignores:
+  - src/ib15/cli.py
+  - src/ib15/__main__.py
+rule:
+  any:
+    - kind: import_from_statement
+      regex: '^from\s+(ib15)?\.(cli|__main__)\b'
+    - kind: import_from_statement
+      regex: '(?s)^from\s+(ib15|\.)\s+import\b.*\b(cli|__main__)\b'
+    - kind: import_statement
+      regex: '^import\s+ib15\.(cli|__main__)\b'
+---
+id: ib15-library-imports-no-tests
+language: Python
+severity: error
+message: "Library code never imports tests or test tools (tests, conftest, pytest, hypothesis). Put shared test helpers in tests/conftest.py."
+files:
+  - src/**/*.py
+rule:
+  any:
+    - kind: import_from_statement
+      regex: '^from\s+(tests|conftest|pytest|_pytest|hypothesis)\b'
+    - kind: import_statement
+      regex: '^import\s+(tests|conftest|pytest|_pytest|hypothesis)\b'
+---
+id: ib15-network-only-in-omie
+language: Python
+severity: error
+message: "Network access goes through ib15.omie.http_get. Take a fetch callable that defaults to it, so the tests stay offline with a stub."
+files:
+  - src/**/*.py
+ignores:
+  - src/ib15/omie.py
+rule:
+  any:
+    - kind: import_from_statement
+      regex: '^from\s+(urllib\.request|urllib\.error|http\.client|socket|requests|httpx|aiohttp|urllib3)\b'
+    - kind: import_from_statement
+      regex: '(?s)^from\s+(urllib|http)\s+import\b.*\b(request|error|client)\b'
+    - kind: import_statement
+      regex: '^import\s+(urllib\.request|urllib\.error|http\.client|socket|requests|httpx|aiohttp|urllib3)\b'
+---
+id: ib15-settings-only-in-cli
+language: Python
+severity: error
+message: "Settings enter through the command line in ib15.cli (argparse, IB15_DATA_DIR). Pass them to library functions as arguments."
+files:
+  - src/**/*.py
+ignores:
+  - src/ib15/cli.py
+rule:
+  any:
+    - kind: import_statement
+      regex: '^import\s+argparse\b'
+    - kind: import_from_statement
+      regex: '^from\s+argparse\s+import\b'
+    - kind: import_from_statement
+      regex: '(?s)^from\s+os\s+import\b.*\b(environ|getenv)\b'
+    - kind: attribute
+      regex: '^os\.(environ|getenv)$'
+---
+id: ib15-plots-only-in-eda
+language: Python
+severity: error
+message: "Figures are drawn only in ib15.eda. Return a table and plot it there."
+files:
+  - src/**/*.py
+ignores:
+  - src/ib15/eda.py
+rule:
+  any:
+    - kind: import_statement
+      regex: '^import\s+matplotlib\b'
+    - kind: import_from_statement
+      regex: '^from\s+matplotlib\b'
+---
+id: ib15-lp-only-in-battery
+language: Python
+severity: error
+message: "The battery linear programme is solved only in ib15.battery. Call battery.solve_day instead of scipy.optimize."
+files:
+  - src/**/*.py
+ignores:
+  - src/ib15/battery.py
+rule:
+  any:
+    - kind: import_statement
+      regex: '^import\s+scipy\.optimize\b'
+    - kind: import_from_statement
+      regex: '^from\s+scipy\.optimize\b'
+    - kind: import_from_statement
+      regex: '(?s)^from\s+scipy\s+import\b.*\boptimize\b'
+---
+id: ib15-tests-load-fixtures-through-conftest
+language: Python
+severity: error
+message: "Tests load fixture files through conftest.FIXTURES (tests/fixtures). Import FIXTURES or fixture_text from conftest instead of building the path."
+files:
+  - tests/**/*.py
+ignores:
+  - tests/conftest.py
+rule:
+  kind: string_content
+  regex: '(^|/)fixtures(/|$)'

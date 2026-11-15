@@ -10,7 +10,7 @@ Data lives outside the repo. Set `IB15_DATA_DIR` to the data folder, or pass `--
 
 ```
 uv sync
-export IB15_DATA_DIR=D:/code/iberian-battery-15min-data
+export IB15_DATA_DIR=/path/to/iberian-battery-15min-data
 uv run ib15 download omie    # optional: --start YYYY-MM-DD --end YYYY-MM-DD
 uv run ib15 build
 ```
@@ -34,7 +34,7 @@ uv run ib15 build weather       # after `ib15 build`
 
 The source is Open-Meteo's Previous Runs API (free for non-commercial use, no key). It serves one fixed model, ECMWF IFS 0.25° (`ecmwf_ifs025`), at the `_previous_day2` lead: the forecast made at least 48 hours before each hour. The variables are hourly `temperature_2m` (°C), `wind_speed_100m` (m/s) and `shortwave_radiation` (W/m²). There are ten locations in mainland Spain: Madrid, Barcelona, Valencia, Sevilla, Zaragoza, Burgos, Lugo, Badajoz, Ciudad Real and Albacete. The coordinates are in `src/ib15/weather.py`.
 
-Bids for delivery day D close at 12:00 Madrid time on D-1. Every forecast value used for D comes from a model run that ECMWF had published by about 08:00 UTC on D-1. The newest is the 00 UTC run of D-1, which the late hours of D use through Open-Meteo's interpolation from 3-hourly to hourly values. That is at least two hours before the deadline. The one-day lead (`_previous_day1`) would break this rule. The evidence is in the docstring of `src/ib15/weather.py`, and `build weather` checks the rule for every hour.
+Bids for delivery day D close at 12:00 Madrid time on D-1. Every forecast value used for D comes from a model run that ECMWF had published by about 08:00 UTC on D-1. The newest is the 00 UTC run of D-1, which the late hours of D use through Open-Meteo's interpolation from 3-hourly to hourly values. That is at least two hours before the deadline. The one-day lead (`_previous_day1`) would break this rule. The evidence is under "Method notes" below, and `build weather` checks the rule for every hour.
 
 `download weather` makes one request per location and calendar month and saves each response unchanged to `$IB15_DATA_DIR/raw/openmeteo/` as `<location>.<model>.<start>.<end>.json`. It pauses between requests and validates each response before saving it. A month is skipped when it ends at least two days before today and a valid saved file for the same location, with no null values anywhere in it, covers all of its dates. That file can be the month's own file or a wider one, so a narrower run inside a month that is already complete fetches nothing. Otherwise the month is fetched again, because a recent month's last hours may not have been filled in when it was fetched. A new file replaces older files of the same location whose dates lie inside its own; a file that reaches outside the new one is kept, and if it overlaps the new one, `build weather` names both files so you can delete one. The default range starts on 2025-09-30, because the first price day begins at 22:00 UTC that day, and ends on the latest day in `raw/omie`. Any failed request is listed at the end and the command exits non-zero.
 
@@ -116,6 +116,65 @@ It checks every input before it writes anything. It stops with an error if `pric
 - `forecast_regret_drivers.csv`: how well each day's forecast errors track the value the battery loses. The daily regret is the perfect-foresight net value minus the model's net value at 15 minutes, in EUR/MW. Per duration and model the file gives the Spearman correlation across days between the regret and the day's mean absolute 15-minute error (`spearman_regret_mae`), and between the regret and the day's Kendall tau (`spearman_regret_tau`). The `pooled` row of each duration stacks the three models' days, so `observations` is three times `days` there. A larger error should go with a larger regret and a higher tau with a smaller one, so the first correlation is expected to be positive and the second negative. These correlations are descriptive.
 - `forecast_window_sensitivity.csv`: a check of the 56-day window. The `expert` and `expert_weather` models are refitted on windows of 28, 56 and 112 days and all compared on the same days: the days the 112-day window can forecast, from the 120th day of the dataset. Perfect foresight is computed on those days too. Per duration, model and window it gives the number of days, the mean absolute 15-minute error, the net value as a percentage of perfect foresight at 15 minutes and at the hourly resolution, and the 15-minute uplift in EUR/MW a day and as a percentage of the perfect-foresight uplift. The 56-day rows differ from the main results only because they cover fewer days. With 28 days, each quarter-hour's regression estimates 10 coefficients (13 with weather) from 28 observations, so its forecasts are noisy, and noise in the within-hour shape costs more at 15 minutes than at the hourly resolution, where four forecasts are averaged. The main results stay at 56 days, on their own evaluation days, because that window was fixed before any result was seen. On the common days the 112-day window does better on every measure, so the 56-day capture is not the best these models can do.
 - `forecast_meta.json`: the timing rule, the window, each model's regressors, the holiday rule, dates and sources, the evaluation dates and count, the Diebold–Mariano settings and the lags of its check, the windows and evaluation dates of the window check, the bootstrap settings, the definitions of the daily Kendall tau and of the regret correlations, the battery specification, the forecast and solve times and the git commit.
+
+## Method notes
+
+Facts behind the code that the sections above do not state.
+
+OMIE files (`src/ib15/omie.py`):
+
+- A file is latin-1 text: a `MARGINALPDBC;` header line, then rows `year;month;day;period;price_PT;price_ES;` in EUR/MWh, then a `*` trailer line.
+- Periods count from local midnight, Europe/Madrid. From 2025-10-01 a period is 15 minutes, so a day has 96 periods (92 or 100 on DST change days); before that a period was one hour.
+- Versions seen so far go up to `.3`; `download omie` tries up to `.9`. A day already saved at version v asks for v again; if v is no longer served it tries v+1 to 9. A new day tries 1 to 9. Days more than one day after today (Madrid) are not requested.
+- The fetch function returns the body, or None on HTTP 404; any other failure raises and is reported for that day.
+
+Price dataset (`src/ib15/dataset.py`):
+
+- A period's UTC start is local midnight in UTC plus (period - 1) × 15 minutes, which stays correct on DST change days.
+- In `prices_hourly.parquet`, an hour is a group of four consecutive periods from local midnight and `period` is the 1-based hour index.
+- `build` lists every problem it finds, not only the first.
+- `missing_periods` and `duplicate_periods` in `coverage.json`, and `nulls` in `weather_coverage.json`, are always 0 or empty, because validation rejects any dataset that has them. They are recorded so the files state it.
+
+Battery model (`src/ib15/battery.py`):
+
+- In each period t the battery charges c_t and discharges d_t MW, each between 0 and 1 MW, with c_t + d_t ≤ 1 MW.
+- Stored energy: s_t = s_(t-1) + η c_t Δt - d_t Δt / η, with η = √0.88 for charging and for discharging, 0 ≤ s_t ≤ capacity, and s at the start and end of the day at half capacity. `energy` in a solved day is s at the end of each period.
+- Objective: gross revenue Σ p_t (d_t - c_t) Δt minus the degradation cost of each MWh discharged at the grid side (Σ d_t Δt).
+- The hourly case decides one c and d per hour at the hourly price, so its schedule is feasible at 15 minutes and earns the same there.
+- A period counts as charging and discharging at once when both exceed 1e-6 MW. With no degradation cost some of these are the solver's tie-breaking: in a zero-price period, doing both leaves the objective unchanged.
+- A percentage is empty (NaN) when its reference total is within 1e-6 EUR/MW of zero, so solver noise around zero does not give a huge percentage. This applies to the perfect-foresight uplift and to the forecast summary's shares of perfect foresight.
+- A `.prev` file that cannot be deleted after a run has put its new files in place is deleted by the next run.
+
+Weather timing (`src/ib15/weather.py`):
+
+- Source: `https://previous-runs-api.open-meteo.com/v1/forecast`. Its docs (https://open-meteo.com/en/docs/previous-runs-api, read 2026-11-07) say past forecasts are "aligned to fixed lead-time offsets of 1-7 days"; `_previous_day1` "returns the value predicted 24 hours before valid time", and `_previous_day2` the value predicted 48 hours before.
+- The `ecmwf_ifs025` archive covers 2025-09-29 onward with no gaps at the ten locations (checked 2026-11-07).
+- What a `_previous_day2` value is, checked on 2026-11-04 against the Single Runs API (`single-runs-api.open-meteo.com`, `&run=`): IFS 0.25° open data is 3-hourly at these leads (https://open-meteo.com/en/docs/ecmwf-api: "3-Hourly, 6-hourly after 144 hours"; a run every 6 hours). At a 3-hourly valid time v the value is that of the run started at floor_6h(v - 48 h), the latest run with a lead of at least 48 h (48 to 53 h).
+- Open-Meteo interpolates the hours in between after that selection, from the 3-hourly `_previous_day2` series (Hermite, two points either side; 41 of 42 hours reproduced to 0.05 °C). So hour t uses 3-hourly points up to floor_3h(t) + 6 h, which can come from a run newer than t - 48 h.
+- When a run is public: ECMWF releases 0.25° open data "at the end of the real-time dissemination schedule" (https://www.ecmwf.int/en/forecasts/datasets/open-data). The files of the 00 UTC runs of 2026-11-05 to 07 on https://data.ecmwf.int/forecasts/ are stamped 07:34 UTC (12 UTC run: 19:34). Open-Meteo states an "additional delay of 2 hours compared to the real-time IFS dissemination" (ecmwf-api docs; real-time steps 48 to 57 go out at about 06:00 UTC). The code takes a run as public 8 hours after it starts.
+- The bid deadline for day D is 10:00 UTC on D-1 in summer time and 11:00 UTC in winter time. The latest run any hour of D uses is the 00 UTC run of D-1 (the late UTC hours of D interpolate towards the points at 00 and 03 UTC of D+1), public by about 08:00 UTC, so the rule holds for every hour of D, DST days included, with about 2 hours to spare in summer. `_previous_day1` fails it.
+- A row reads two labels: temperature and wind at its hour H, radiation at H + 1 h ("averaged over the past hour", previous-runs docs). The newest run behind a label does not rise steadily with the label: at 20 UTC, label 20:00 interpolates towards 00 UTC the next day (run 00 UTC D-1), while label 21:00 is a grid point (run 18 UTC D-2). So the check takes the newer run of the two labels.
+- The ten locations are demand centres, wind areas and solar areas of mainland Spain.
+- A response gives its 0.25° grid cell, whose centre is at most about 0.18° from the requested point; a cell more than 0.25° away is rejected.
+- A value outside a plausible range fails validation: temperature -40 to 60 °C, wind speed 0 to 100 m/s, radiation 0 to 1500 W/m².
+
+Forecast (`src/ib15/forecast.py`):
+
+- A holiday is kept when every one of the 19 columns of the annex of the Dirección General de Trabajo's yearly resolution marks it `*` (national, not substitutable) or `**` (national, not substituted by the community). 2025: Resolución de 15 de octubre de 2024, BOE of 18-10-2024. 2026: Resolución de 17 de octubre de 2025, BOE of 28-10-2025.
+- The annexes list no Sundays. 12 October 2025, 1 November 2026 and 6 December 2026 fall on a Sunday; they are national holidays no community can substitute (art. 45.1 of Real Decreto 2001/1983, BOE-A-1983-20906), so they are on the list, and treating them as a Sunday changes nothing.
+- Left out because some communities do not hold them: Holy Thursday (17-04-2025, 02-04-2026; not in Cataluña or the Comunitat Valenciana), 19 March and 25 July, the Mondays after a Sunday holiday (13-10-2025, 02-11-2026, 07-12-2026; only some communities moved the rest day there), and the communities' own holidays (Easter Monday, 26 December and the regional days).
+- The Newey–West variance uses Bartlett weights 1 - k / (lag + 1); at lag 0 it is the variance with divisor n.
+
+Exploratory analysis (`src/ib15/eda.py`):
+
+- An hour is flat when its spread is below 0.005 EUR/MWh: prices have two decimals, so a smaller spread means the four quarter-hours are equal.
+- A daily uplift below 0.01 EUR/MW counts as zero, since both resolutions are solved to HiGHS tolerances.
+- The top 10% and 25% of days are rounded up to whole days.
+- A 100-period DST day has 25 hours.
+- An autocorrelation at a lag of whole days pairs the same local quarter-hour, except across a DST change, where the pair is one hour off.
+- The `oct_nov_2025` window of `one_cycle_spread.csv` is the first two months of 15-minute prices, which came before Rystad Energy's estimate of 10 December 2025.
+- In `fig_b` the hourly steps belong to the season whose profile has the most within-hour shape. In `fig_e` a month the sample covers only in part is labelled with its number of days.
+- Figures use a light palette, since the paper is printed on white, with series colours in a fixed order; they are 6.5 inches wide (one text column) at 300 dpi.
 
 ## Tests
 

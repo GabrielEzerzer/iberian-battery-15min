@@ -18,7 +18,6 @@ def day_of(name):
 
 
 def built(data_dir, names):
-    """Build from the named fixtures, preceded by a file for every day from GO_LIVE."""
     data_dir.fill(day_of(names[0]))
     for n in names:
         data_dir.add(n)
@@ -43,7 +42,7 @@ def test_utc_starts_unique_and_15min_apart_across_dst_days(data_dir, names, dst_
     ts = q["delivery_start_utc"]
     assert str(ts.dt.tz) == "UTC"
     assert ts.is_unique
-    assert (ts.diff().dropna() == pd.Timedelta(minutes=15)).all()  # across both midnights
+    assert (ts.diff().dropna() == pd.Timedelta(minutes=15)).all(), "across both midnights"
     day = q[q["delivery_date"] == dst_day]
     assert day["period"].tolist() == list(range(1, n + 1))
     assert day["delivery_start_utc"].iloc[0] == first_utc
@@ -91,10 +90,10 @@ def test_coverage_records_non_v1_day(data_dir):
 
 def test_es_and_pt_prices_land_in_their_columns(data_dir):
     q, _, _ = built(data_dir, ["marginalpdbc_20251001.1"])
-    # The fixture's period 40 is PT 60.87, ES 60; period 73 is PT 60, ES 59.07.
     rows = q.set_index("period")
-    assert (rows.loc[40, "price_es"], rows.loc[40, "price_pt"]) == (60.0, 60.87)
-    assert (rows.loc[73, "price_es"], rows.loc[73, "price_pt"]) == (59.07, 60.0)
+    from_the_file = "marginalpdbc_20251001.1: period 40 is PT 60.87, ES 60; 73 is PT 60, ES 59.07"
+    assert (rows.loc[40, "price_es"], rows.loc[40, "price_pt"]) == (60.0, 60.87), from_the_file
+    assert (rows.loc[73, "price_es"], rows.loc[73, "price_pt"]) == (59.07, 60.0), from_the_file
 
 
 def _with_period_5(edit):

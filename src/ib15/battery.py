@@ -1,19 +1,5 @@
-"""Perfect-foresight battery arbitrage value on the day-ahead prices, at 15-minute and hourly
-resolution.
-
-Each delivery day is a separate linear programme solved with HiGHS. Per period t the battery
-charges c_t and discharges d_t MW (both in [0, POWER_MW]); the energy in it evolves as
-s_t = s_{t-1} + ETA * c_t * dt - d_t * dt / ETA, stays within [0, energy capacity], and starts
-and ends the day at SOC_START of capacity. Both c_t and d_t can be positive in the same period:
-that stands for the battery alternating between charging and discharging within the period,
-which burns energy in the efficiency losses (worth doing at negative prices). A single
-converter can alternate only up to its rated power in total, so c_t + d_t <= POWER_MW. The
-objective is gross revenue sum(price_t * (d_t - c_t) * dt) minus a degradation cost per MWh
-discharged at the grid side.
-The hourly case decides one c and d per hour at the hourly price (the mean of the hour's four
-quarter-hours), so its schedule is feasible at 15 minutes and earns the same there.
-"""
-
+# Perfect-foresight battery arbitrage value on the day-ahead prices, at 15-minute and hourly
+# resolution. The linear programme is set out in the README, "Method notes".
 import contextlib
 import json
 import math
@@ -32,18 +18,18 @@ from ib15.dataset import BuildError, _git
 POWER_MW = 1.0
 DURATIONS_H = (1, 2, 4)
 RTE = 0.88
-ETA = math.sqrt(RTE)  # charge and discharge efficiency each
-SOC_START = 0.5  # fraction of energy capacity at the start and end of every delivery day
+ETA = math.sqrt(RTE)
+SOC_START = 0.5
 DT_15MIN = 0.25
 DT_HOURLY = 1.0
-SIMULTANEOUS_TOL = 1e-6  # MW; a period with both c and d above this counts as simultaneous
+SIMULTANEOUS_TOL_MW = 1e-6
 
 
 @dataclass(frozen=True)
 class Spec:
     name: str
-    cost_per_mwh: float  # EUR per MWh discharged at the grid side
-    max_cycles: float | None  # full cycles a day, None for no cap
+    cost_per_mwh: float
+    max_cycles: float | None
 
 
 SPECS = (
@@ -51,10 +37,8 @@ SPECS = (
     Spec("no_cost", 0.0, None),
     Spec("cap2", 0.0, 2.0),
 )
-MAIN_SPEC = SPECS[0]  # the only spec also solved on the Portuguese price
+MAIN_SPEC = SPECS[0]
 
-# Wear costs (EUR per MWh discharged) for the no-cap sensitivity. A cost that an existing no-cap
-# spec already has reuses that spec's solves, so 0 and 20 are the no_cost and main rows.
 SENSITIVITY_COSTS = (0.0, 10.0, 20.0, 30.0, 40.0)
 SENSITIVITY_SPECS = tuple(
     next(
@@ -65,11 +49,10 @@ SENSITIVITY_SPECS = tuple(
 )
 SOLVED_SPECS = SPECS + tuple(s for s in SENSITIVITY_SPECS if s not in SPECS)
 
-# Uncertainty: a circular moving-block bootstrap over days, set in advance, not tuned.
 BOOT_BLOCK_DAYS = 7
 BOOT_RESAMPLES = 10_000
 BOOT_SEED = 20251001
-BOOT_PERCENTILES = (2.5, 97.5)  # a 95% percentile interval
+BOOT_PERCENTILES = (2.5, 97.5)
 UNCERTAINTY_STATS = ("net_uplift_eur_per_mw_day", "net_uplift_pct")
 
 
@@ -79,8 +62,6 @@ class SolveError(Exception):
 
 @dataclass
 class Dispatch:
-    """An optimal day: per-period charge, discharge and end-of-period energy at ``dt`` hours."""
-
     charge: np.ndarray
     discharge: np.ndarray
     energy: np.ndarray
@@ -92,33 +73,36 @@ class Dispatch:
     simultaneous: int
 
     def quarter_hourly(self) -> tuple[np.ndarray, np.ndarray]:
-        """Charge and discharge expanded to 15-minute periods (power constant within each)."""
         k = round(self.dt / DT_15MIN)
         return np.repeat(self.charge, k), np.repeat(self.discharge, k)
 
 
 def solve_day(prices, dt: float, energy_mwh: float, spec: Spec) -> Dispatch:
-    """Maximise one day's net value. Variables are x = [c, d, s], each of length n."""
     p = np.asarray(prices, dtype=float)
     n = len(p)
     s0 = SOC_START * energy_mwh
     eye = sparse.identity(n, format="csr")
     shift = sparse.eye(n, k=-1, format="csr")
-    # s_t - s_{t-1} - ETA*dt*c_t + dt/ETA*d_t = 0, with s_{-1} = s0 moved to the right side.
-    a_eq = sparse.hstack([-ETA * dt * eye, (dt / ETA) * eye, eye - shift], format="csr")
-    b_eq = np.zeros(n)
-    b_eq[0] = s0
+    energy_balance = sparse.hstack([-ETA * dt * eye, (dt / ETA) * eye, eye - shift], format="csr")
+    energy_balance_rhs = np.zeros(n)
+    energy_balance_rhs[0] = s0
     bounds = [(0.0, POWER_MW)] * (2 * n) + [(0.0, energy_mwh)] * (n - 1) + [(s0, s0)]
-    # linprog minimises: charging costs p*dt, discharging earns (p - cost)*dt.
-    obj = np.concatenate([p * dt, -(p - spec.cost_per_mwh) * dt, np.zeros(n)])
-    # c_t + d_t <= POWER_MW: the converter's rated power is shared within each period.
-    a_ub = sparse.hstack([eye, eye, sparse.csr_matrix((n, n))], format="csr")
-    b_ub = np.full(n, POWER_MW)
+    cost = np.concatenate([p * dt, -(p - spec.cost_per_mwh) * dt, np.zeros(n)])
+    limits = sparse.hstack([eye, eye, sparse.csr_matrix((n, n))], format="csr")
+    limits_rhs = np.full(n, POWER_MW)
     if spec.max_cycles is not None:
-        cycles = sparse.csr_matrix(np.concatenate([np.zeros(n), np.full(n, dt), np.zeros(n)]))
-        a_ub = sparse.vstack([a_ub, cycles], format="csr")
-        b_ub = np.append(b_ub, spec.max_cycles * energy_mwh)
-    res = linprog(obj, A_ub=a_ub, b_ub=b_ub, A_eq=a_eq, b_eq=b_eq, bounds=bounds, method="highs")
+        discharged = sparse.csr_matrix(np.concatenate([np.zeros(n), np.full(n, dt), np.zeros(n)]))
+        limits = sparse.vstack([limits, discharged], format="csr")
+        limits_rhs = np.append(limits_rhs, spec.max_cycles * energy_mwh)
+    res = linprog(
+        cost,
+        A_ub=limits,
+        b_ub=limits_rhs,
+        A_eq=energy_balance,
+        b_eq=energy_balance_rhs,
+        bounds=bounds,
+        method="highs",
+    )
     if res.status != 0:
         raise SolveError(
             f"HiGHS did not find an optimum ({spec.name}, {energy_mwh} MWh, dt {dt} h, "
@@ -137,20 +121,13 @@ def solve_day(prices, dt: float, energy_mwh: float, spec: Spec) -> Dispatch:
         degradation=degradation,
         net=gross - degradation,
         discharged_mwh=discharged,
-        # Periods in which the battery time-shares its converter between charging and
-        # discharging (both positive, together at most POWER_MW). With a 0 EUR/MWh cost some of
-        # these can be the solver's tie-breaking: in a zero-price period, charging and
-        # discharging at once leaves the objective unchanged, so either solution is optimal.
-        simultaneous=int(np.sum((c > SIMULTANEOUS_TOL) & (d > SIMULTANEOUS_TOL))),
+        simultaneous=int(np.sum((c > SIMULTANEOUS_TOL_MW) & (d > SIMULTANEOUS_TOL_MW))),
     )
 
 
 def daily_values(
     q: pd.DataFrame, h: pd.DataFrame, price: str = "price_es", specs=SOLVED_SPECS
 ) -> pd.DataFrame:
-    """One row per (delivery_date, duration_h, spec, resolution) from the ``price`` column of the
-    15-minute and hourly price tables, for each spec in ``specs``. Raises BuildError if the
-    hourly prices are not the means of the quarters."""
     q = q.sort_values(["delivery_date", "period"])
     h = h.sort_values(["delivery_date", "period"])
     hourly = {d: g[price].to_numpy() for d, g in h.groupby("delivery_date")}
@@ -187,9 +164,6 @@ def daily_values(
 
 
 def _compare(daily: pd.DataFrame, hours: int, spec: Spec) -> dict:
-    """Sample totals at both resolutions for one (duration_h, spec), the 15-minute uplift and
-    mean cycles a day. Percent uplift is NaN when the hourly total is zero (within 1e-6 EUR/MW,
-    so solver noise around zero does not give a huge percentage)."""
     g = daily[(daily["duration_h"] == hours) & (daily["spec"] == spec.name)]
     r15 = g[g["resolution"] == "15min"].set_index("delivery_date")
     rh = g[g["resolution"] == "hourly"].set_index("delivery_date")
@@ -215,7 +189,6 @@ def _compare(daily: pd.DataFrame, hours: int, spec: Spec) -> dict:
 
 
 def summarise(daily: pd.DataFrame) -> pd.DataFrame:
-    """One row per (duration_h, spec) of SPECS, from ``_compare``."""
     return pd.DataFrame(
         [
             {"duration_h": hours, "spec": spec.name} | _compare(daily, hours, spec)
@@ -226,7 +199,6 @@ def summarise(daily: pd.DataFrame) -> pd.DataFrame:
 
 
 def cost_sensitivity(daily: pd.DataFrame) -> pd.DataFrame:
-    """One row per (duration_h, cost_eur_per_mwh) of the no-cap wear-cost grid."""
     return pd.DataFrame(
         [
             {"duration_h": hours, "cost_eur_per_mwh": spec.cost_per_mwh}
@@ -240,11 +212,6 @@ def cost_sensitivity(daily: pd.DataFrame) -> pd.DataFrame:
 def bootstrap_days(
     n: int, block: int = BOOT_BLOCK_DAYS, resamples: int = BOOT_RESAMPLES, seed: int = BOOT_SEED
 ) -> np.ndarray:
-    """Circular moving-block bootstrap of ``n`` days: shape (resamples, n), each row the day
-    indices (0..n-1) of one resample. A row joins blocks of ``block`` consecutive days, each
-    starting at a uniformly drawn day and wrapping from the last day to the first, cut to ``n``
-    days. Draw it once and resample every statistic on the same rows, so comparisons stay
-    paired."""
     if n < 1:
         raise ValueError("no days to resample")
     rng = np.random.default_rng(seed)
@@ -253,15 +220,12 @@ def bootstrap_days(
 
 
 def percent(x, ref) -> np.ndarray:
-    """100 * x / ref elementwise, NaN where ref is zero (within 1e-6 EUR/MW), as the summaries
-    compute their percentages."""
     x, ref = np.asarray(x, dtype=float), np.asarray(ref, dtype=float)
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(np.abs(ref) <= 1e-6, np.nan, 100 * x / ref)
 
 
 def interval(stats) -> tuple[float, float]:
-    """The BOOT_PERCENTILES of a statistic over the resamples; NaN if it is undefined on any."""
     stats = np.asarray(stats, dtype=float)
     if np.isnan(stats).any():
         return math.nan, math.nan
@@ -284,9 +248,6 @@ def bootstrap_meta() -> dict:
 
 
 def uplift_statistics(daily: pd.DataFrame, hours: int, spec: str, idx) -> dict[str, np.ndarray]:
-    """The 15-minute net uplift of one (duration_h, spec) on each resample of days (the rows of
-    ``idx``, indices into the sorted days), as ``_compare`` computes it: in EUR/MW a day (a mean
-    over the days) and in percent of the hourly total (a ratio of sums)."""
     g = daily[(daily["duration_h"] == hours) & (daily["spec"] == spec)]
     w = g.pivot(index="delivery_date", columns="resolution", values="net_eur_per_mw").sort_index()
     v15, vh = w["15min"].to_numpy()[idx], w["hourly"].to_numpy()[idx]
@@ -297,8 +258,6 @@ def uplift_statistics(daily: pd.DataFrame, hours: int, spec: str, idx) -> dict[s
 
 
 def uncertainty(daily: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
-    """Per (duration_h, spec) of the summary and statistic in UNCERTAINTY_STATS: the summary's
-    value and its bootstrap interval, every row resampled on the same days."""
     idx = bootstrap_days(daily["delivery_date"].nunique())
     s = summary.set_index(["duration_h", "spec"])
     rows = []
@@ -321,10 +280,6 @@ def uncertainty(daily: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def portugal(daily: pd.DataFrame, daily_pt: pd.DataFrame) -> pd.DataFrame:
-    """One row per (duration_h, market) for the main spec: ``_compare`` on the Spanish daily
-    values (``daily``, so the es rows are the summary's main rows) and on the Portuguese ones
-    (``daily_pt``), with the bootstrap interval of each UNCERTAINTY_STATS statistic. Both markets
-    are resampled on the same days."""
     idx = bootstrap_days(daily["delivery_date"].nunique())
     rows = []
     for hours in DURATIONS_H:
@@ -338,9 +293,6 @@ def portugal(daily: pd.DataFrame, daily_pt: pd.DataFrame) -> pd.DataFrame:
 
 
 def price_agreement(q: pd.DataFrame) -> dict:
-    """How close the Portuguese 15-minute price is to the Spanish one: the share of quarter-hours
-    where they are equal, the mean absolute difference, and each market's mean within-hour
-    spread (max minus min of an hour's four quarter-hours, averaged over hours)."""
     q = q.sort_values(["delivery_date", "period"])
     diff = (q["price_pt"] - q["price_es"]).abs()
     hours = q.assign(hour=(q["period"] - 1) // 4).groupby(["delivery_date", "hour"])
@@ -357,20 +309,8 @@ def price_agreement(q: pd.DataFrame) -> dict:
 
 
 def _write_all(files: dict[Path, Callable[[Path], object]]) -> None:
-    """Replace a set of files all together, or leave the previous set as it was.
-
-    Every file is written to ``<name>.part`` first. Then each existing file is moved aside to
-    ``<name>.prev``, so a file another program holds open (on Windows, a CSV open in Excel)
-    fails before anything new is in place. Only then are the parts renamed into place and the
-    ``.prev`` files deleted. On any failure the files moved aside are moved back and the parts
-    are removed.
-    """
     part = {p: p.with_name(p.name + ".part") for p in files}
     prev = {p: p.with_name(p.name + ".prev") for p in files}
-    # Files left by a run that was killed. While any of its parts is left it had not put all its
-    # files in place, so its .prev files are the previous set and go back; otherwise they are
-    # stale. shortcut: a file with no previous version that such a run had already put in place
-    # stays; a journal file would fix that if it ever matters.
     killed_before_done = any(t.exists() for t in part.values())
     for p, old in prev.items():
         if not old.exists():
@@ -397,7 +337,6 @@ def _write_all(files: dict[Path, Callable[[Path], object]]) -> None:
             part[p].replace(p)
             placed.append(p)
     except BaseException:
-        # The parts go last: while one is left, the next run knows this one did not finish.
         for p in placed:
             if p not in moved:
                 p.unlink()
@@ -407,14 +346,11 @@ def _write_all(files: dict[Path, Callable[[Path], object]]) -> None:
             t.unlink(missing_ok=True)
         raise
     for p in moved:
-        # The new set is in place; a .prev that cannot be deleted now is deleted by the next run.
         with contextlib.suppress(OSError):
             prev[p].unlink()
 
 
 def perfect_foresight(data_dir: Path) -> dict:
-    """Solve every day of the dataset and write the results to ``data_dir/results``. Nothing is
-    written unless every solve succeeds. Returns the meta record."""
     ds = data_dir / "dataset"
     paths = [ds / "prices_15min.parquet", ds / "prices_hourly.parquet"]
     for p in paths:
@@ -446,7 +382,7 @@ def perfect_foresight(data_dir: Path) -> dict:
         "cost_sensitivity_eur_per_mwh_discharged": list(SENSITIVITY_COSTS),
         "hourly": "one charge and discharge power per hour at the hourly price (mean of quarters)",
         "solver": "scipy.optimize.linprog, method highs",
-        "simultaneous_tolerance_mw": SIMULTANEOUS_TOL,
+        "simultaneous_tolerance_mw": SIMULTANEOUS_TOL_MW,
         "simultaneous_periods": {
             f"{spec} {res}": int(n)
             for (spec, res), n in daily.groupby(["spec", "resolution"])["simultaneous_periods"]
