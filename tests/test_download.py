@@ -17,8 +17,8 @@ def body(day):
 
 
 class FakeOmie:
-    def __init__(self, files, log=None):
-        self.files = files
+    def __init__(self, body_none_for_404_or_exception_by_file_name, log=None):
+        self.files = body_none_for_404_or_exception_by_file_name
         self.requested = []
         self.log = log
 

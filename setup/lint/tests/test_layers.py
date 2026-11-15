@@ -21,6 +21,8 @@ CASES = {
             "from ib15 import omie, battery\n",
             "from . import battery\n",
             "from ib15 import (\n    omie,\n    battery,\n)\n",
+            "import ib15.omie, ib15.battery\n",
+            "import ib15.omie as o, ib15.battery as b\n",
         ),
         "from ib15.omie import FILE_RE, read_day\nimport ib15.omie\nfrom ib15 import omie\n"
         "from .omie import read_day\nfrom ib15 import (\n    omie,\n)\nimport ib15.omie as o\n",
@@ -32,6 +34,8 @@ CASES = {
             "from ib15 import dataset, battery\n",
             "from .battery import SPECS\n",
             "from ib15 import (\n    dataset,\n    battery,\n)\n",
+            "import ib15.dataset, ib15.battery\n",
+            "import ib15.battery as omie\n",
         ),
         "from ib15.dataset import BuildError\nfrom ib15.omie import MADRID\nfrom ib15 import dataset\n"
         "from ib15 import (\n    omie,\n    dataset,\n)\nfrom .dataset import BuildError\n",

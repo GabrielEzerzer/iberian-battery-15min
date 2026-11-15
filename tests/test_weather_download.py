@@ -32,8 +32,8 @@ def query(url):
 
 
 class FakeOpenMeteo:
-    def __init__(self, override=None, log=None):
-        self.override = override or {}
+    def __init__(self, body_or_exception_by_lat_start_else_default=None, log=None):
+        self.override = body_or_exception_by_lat_start_else_default or {}
         self.requested = []
         self.log = log
 

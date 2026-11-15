@@ -30,25 +30,26 @@ def data_dir(tmp_path):
     class DataDir(type(tmp_path)):
         pass
 
-    def add(name, text=None):
-        if text is None:
+    def add(name, text_instead_of_fixture=None):
+        if text_instead_of_fixture is None:
             shutil.copy(FIXTURES / name, raw / name)
         else:
-            (raw / name).write_bytes(text.encode("latin-1"))
+            (raw / name).write_bytes(text_instead_of_fixture.encode("latin-1"))
         return raw / name
 
-    def fill(until):
+    def fill_version_1_from_go_live_to_day_before(until):
         day = GO_LIVE
         while day < until:
             name = file_name(day, 1)
-            if (FIXTURES / name).exists():
+            real_fixture_exists = (FIXTURES / name).exists()
+            if real_fixture_exists:
                 add(name)
             else:
-                add(name, day_text(day))
+                add(name, text_instead_of_fixture=day_text(day))
             day += timedelta(days=1)
 
     d = DataDir(tmp_path)
     d.add = add
-    d.fill = fill
+    d.fill = fill_version_1_from_go_live_to_day_before
     d.raw = raw
     return d
