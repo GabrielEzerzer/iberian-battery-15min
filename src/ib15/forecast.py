@@ -1,30 +1,5 @@
-"""Day-ahead price forecasts from public data available at bid time, and the battery value they
-capture at 15-minute and hourly resolution.
-
-Timing: the bid for delivery day D closes at 12:00 Madrid time on D-1. The forecast for D uses
-the prices of delivery days up to D-1 (D-1's are public at about 13:00 on D-2) and the weather
-of day D from ``prices_weather_15min.parquet``, whose every value ``ib15 build weather`` has
-checked was issued before that deadline. Nothing from D's prices or any later day enters.
-
-Every day is represented by its 96 local wall-clock quarter-hours (Europe/Madrid). On the
-92-period DST day the missing hour's slots take the preceding hour's values; on the 100-period
-day the repeated hour's two occurrences are averaged. A forecast is mapped back to the day's real
-periods: both occurrences of a repeated hour get the slot forecast, and a missing hour is dropped.
-
-A national public holiday (HOLIDAYS) is treated as a Sunday. Models, each forecasting every
-slot of D:
-- ``naive``: on a holiday, the same slot on the most recent Sunday before D; otherwise the same
-  slot on D-7 for Monday, Saturday and Sunday, on D-1 for the other weekdays.
-- ``expert``: one least-squares regression per slot s, fitted on the WINDOW_DAYS days before D:
-  intercept, the price of slot s on D-1, D-2 and D-7, the minimum, maximum and last slot of D-1,
-  and Monday, Saturday and Sunday dummies (on a holiday: Sunday 1, Monday and Saturday 0).
-- ``expert_weather``: ``expert`` plus the national mean (of the ten locations) temperature,
-  100 m wind speed and radiation for slot s on D.
-
-The hourly forecast is the mean of each hour's four quarter-hour forecasts. The battery (the
-``main`` spec) plans each day on the forecast and is paid the actual prices.
-"""
-
+# Day-ahead price forecasts from public data available at bid time, and the battery value they
+# capture at 15-minute and hourly resolution.
 import json
 import math
 import time
@@ -42,37 +17,19 @@ from ib15.omie import MADRID
 from ib15.weather import LOCATIONS, VARIABLES
 
 SLOTS = 96
-WINDOW_DAYS = 56  # fixed in advance, not tuned
+WINDOW_DAYS = 56
 LAGS = (1, 2, 7)
 
 
 def first_eval(window: int) -> int:
-    """Index (0-based) of the first day a ``window``-day fit can forecast: the oldest training
-    day (D-window) needs its D-7 lag."""
     return window + max(LAGS)
 
 
 FIRST_EVAL = first_eval(WINDOW_DAYS)
 MODELS = ("naive", "expert", "expert_weather")
-NAIVE_WEEKLY = (0, 5, 6)  # Monday, Saturday, Sunday use the same slot a week earlier
-SENSITIVITY_WINDOWS = (28, 56, 112)  # training windows of the robustness check, in days
+NAIVE_WEEKLY_WEEKDAYS = (0, 5, 6)
+SENSITIVITY_WINDOWS = (28, 56, 112)
 SENSITIVITY_MODELS = ("expert", "expert_weather")
-# Spain's national public holidays that are holidays in every autonomous community and in Ceuta
-# and Melilla, treated as Sundays. Source: the annex of the Dirección General de Trabajo's yearly
-# resolution; a day is kept when every one of its 19 columns marks it "*" (national, not
-# substitutable) or "**" (national, not substituted by the community):
-# - 2025: Resolución de 15 de octubre de 2024, BOE of 18-10-2024,
-#   https://www.boe.es/diario_boe/txt.php?id=BOE-A-2024-21316
-# - 2026: Resolución de 17 de octubre de 2025, BOE of 28-10-2025,
-#   https://www.boe.es/diario_boe/txt.php?id=BOE-A-2025-21667
-# The annexes list no Sundays. 12 October 2025, 1 November 2026 and 6 December 2026 fall on a
-# Sunday; they are national holidays no community can substitute (art. 45.1 of Real Decreto
-# 2001/1983, BOE-A-1983-20906), so they are included, and treating them as a Sunday changes
-# nothing. Left out because some communities do not hold them: Holy Thursday (17-04-2025,
-# 02-04-2026; not in Cataluña or the Comunitat Valenciana), 19 March and 25 July (each held in
-# some communities only), the Mondays after a Sunday holiday (13-10-2025, 02-11-2026,
-# 07-12-2026; only some communities moved the rest day there), and the communities' own
-# holidays (Easter Monday, 26 December and the regional days).
 HOLIDAYS = tuple(
     date.fromisoformat(d)
     for d in (
@@ -112,26 +69,20 @@ EXPERT_FEATURES = (
     "Sunday",
 )
 WEATHER_FEATURES = tuple(f"national mean {v}, same slot on D" for v in VARIABLES)
-DM_LAG = 7  # Newey-West lag (days) of the Diebold-Mariano variance
-DM_LAGS = (DM_LAG, 14, 28)  # the lags reported in forecast_dm_tests.csv
+DM_LAG = 7
+DM_LAGS = (DM_LAG, 14, 28)
 SPEC = next(s for s in battery.SPECS if s.name == "main")
-BOUND_TOL = 1e-6  # EUR/MW; perfect foresight may not fall further below a forecast's value
+BOUND_TOL_EUR_PER_MW = 1e-6
 PRICE_COLUMNS = ["delivery_start_utc", "delivery_date", "period", "price_es"]
-UPLIFT_DIFFS = (("expert", "naive"), ("expert_weather", "expert"))  # paired uplift differences
-
-
-# ---------------------------------------------------------------- slots
+UPLIFT_DIFFS = (("expert", "naive"), ("expert_weather", "expert"))
 
 
 def local_slots(starts_utc: pd.Series) -> np.ndarray:
-    """Local wall-clock quarter-hour (0..95) of each UTC period start."""
     lt = starts_utc.dt.tz_convert(MADRID)
     return (lt.dt.hour * 4 + lt.dt.minute // 15).to_numpy()
 
 
 def to_slots(values: np.ndarray, slots: np.ndarray) -> np.ndarray:
-    """One day's per-period values (along axis 0) as 96 slot values: a repeated slot is the mean
-    of its occurrences, a missing slot takes the value of the slot an hour earlier."""
     values = np.asarray(values, dtype=float)
     counts = np.bincount(slots, minlength=SLOTS)
     missing = np.flatnonzero(counts == 0)
@@ -141,13 +92,12 @@ def to_slots(values: np.ndarray, slots: np.ndarray) -> np.ndarray:
     np.add.at(sums, slots, values)
     shape = (SLOTS,) + (1,) * (values.ndim - 1)
     out = sums / np.maximum(counts, 1).reshape(shape)
-    for s in missing:  # ascending, so an hour earlier is already filled
+    for s in missing:
         out[s] = out[s - 4]
     return out
 
 
 def national_weather(df: pd.DataFrame) -> np.ndarray:
-    """Per row, the mean of each weather variable over the locations: shape (rows, variables)."""
     return np.column_stack(
         [
             df[[f"{prefix}_{loc}" for loc in LOCATIONS]].mean(axis=1).to_numpy()
@@ -157,8 +107,6 @@ def national_weather(df: pd.DataFrame) -> np.ndarray:
 
 
 def slot_arrays(pw: pd.DataFrame):
-    """From prices with weather columns (sorted by date and period, consecutive days): the
-    dates, prices (days, 96), national weather (days, 96, variables) and each day's slots."""
     wx = national_weather(pw)
     dates, prices, weather, slots = [], [], [], []
     for day, idx in pw.groupby("delivery_date", sort=True).indices.items():
@@ -170,17 +118,11 @@ def slot_arrays(pw: pd.DataFrame):
     return dates, np.array(prices), np.array(weather), slots
 
 
-# ---------------------------------------------------------------- models
-
-
 def day_type(d: date) -> int:
-    """The weekday the models see (Monday 0 .. Sunday 6): a national holiday counts as Sunday."""
     return 6 if d in HOLIDAYS else d.weekday()
 
 
 def features(dates: list[date], p: np.ndarray, w: np.ndarray | None = None) -> np.ndarray:
-    """Regressors of every slot of every day, shape (days, 96, k); NaN for the first 7 days.
-    Row j uses only prices of days before j and, with ``w``, the weather of day j."""
     n = len(dates)
     k = len(EXPERT_FEATURES) + (0 if w is None else w.shape[2])
     f = np.full((n, SLOTS, k), np.nan)
@@ -206,7 +148,6 @@ def features(dates: list[date], p: np.ndarray, w: np.ndarray | None = None) -> n
 
 
 def ols_forecast(f: np.ndarray, p: np.ndarray, t: int, window: int = WINDOW_DAYS) -> np.ndarray:
-    """Per slot, least squares on days t-window..t-1, applied to day t's regressors."""
     if t < first_eval(window):
         raise ValueError(f"day {t} has no full window; the first is {first_eval(window)}")
     out = np.empty(SLOTS)
@@ -218,14 +159,14 @@ def ols_forecast(f: np.ndarray, p: np.ndarray, t: int, window: int = WINDOW_DAYS
 
 def naive_forecast(dates: list[date], p: np.ndarray, t: int) -> np.ndarray:
     if dates[t] in HOLIDAYS:
-        return p[t - (dates[t].weekday() + 1)]  # the most recent Sunday before D
-    return p[t - 7] if dates[t].weekday() in NAIVE_WEEKLY else p[t - 1]
+        days_since_sunday = dates[t].weekday() + 1
+        return p[t - days_since_sunday]
+    return p[t - 7] if dates[t].weekday() in NAIVE_WEEKLY_WEEKDAYS else p[t - 1]
 
 
 def forecast_slots(
     dates: list[date], p: np.ndarray, w: np.ndarray, targets, window: int = WINDOW_DAYS
 ) -> dict[str, np.ndarray]:
-    """Each model's slot forecasts for the target day indices, shape (len(targets), 96)."""
     f_expert, f_weather = features(dates, p), features(dates, p, w)
     return {
         "naive": np.array([naive_forecast(dates, p, t) for t in targets]),
@@ -237,8 +178,6 @@ def forecast_slots(
 def forecast_periods(
     pw: pd.DataFrame, window: int = WINDOW_DAYS, first_index: int | None = None
 ) -> pd.DataFrame:
-    """One row per period of every evaluation day, from day ``first_index`` (by default the first
-    the window can forecast): the price columns and each model's forecast."""
     dates, p, w, slots = slot_arrays(pw)
     first_index = first_eval(window) if first_index is None else first_index
     targets = range(first_index, len(dates))
@@ -250,17 +189,11 @@ def forecast_periods(
     return out
 
 
-# ---------------------------------------------------------------- errors and DM test
-
-
 def _hourly(fc: pd.DataFrame, col: str) -> pd.Series:
-    """Mean of each hour (four consecutive periods of a delivery day) of column ``col``."""
     return fc.groupby([fc["delivery_date"], (fc["period"] - 1) // 4])[col].mean()
 
 
 def errors(fc: pd.DataFrame) -> pd.DataFrame:
-    """Per model: MAE and RMSE at 15 minutes and hourly, and the MAE of the within-hour deviation
-    (a quarter-hour's price minus its hour's mean), forecast against actual."""
     actual_dev = quarter_deviation(fc)
     actual_h = _hourly(fc, "price_es")
     rows = []
@@ -290,7 +223,6 @@ def daily_mae(fc: pd.DataFrame, model: str) -> pd.Series:
 
 
 def daily_tau(fc: pd.DataFrame, model: str) -> pd.Series:
-    """Per day, Kendall's tau-b between the forecast and actual prices of the day's periods."""
     return pd.Series(
         {
             day: kendalltau(g[model], g["price_es"]).statistic
@@ -300,9 +232,6 @@ def daily_tau(fc: pd.DataFrame, model: str) -> pd.Series:
 
 
 def regret_drivers(fc: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
-    """Per duration and model, and pooled over the models: the Spearman correlation across days
-    between the daily 15-minute regret (perfect-foresight net minus the model's net, EUR/MW) and
-    the day's 15-minute MAE, and between the regret and the day's Kendall tau."""
     q = daily[daily["resolution"] == "15min"].pivot(
         index="delivery_date", columns=["duration_h", "model"], values="net_eur_per_mw"
     )
@@ -332,8 +261,6 @@ def regret_drivers(fc: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
 
 
 def newey_west_variance(d, lag: int) -> float:
-    """Long-run variance of ``d`` with Bartlett weights 1 - k/(lag+1); lag 0 is the variance
-    with divisor n."""
     d = np.asarray(d, dtype=float) - np.mean(d)
     n = len(d)
     v = d @ d / n
@@ -343,8 +270,6 @@ def newey_west_variance(d, lag: int) -> float:
 
 
 def dm_test(loss_a, loss_b, lag: int) -> dict:
-    """Diebold-Mariano test of equal mean loss on d = loss_a - loss_b, with a Newey-West variance
-    and a two-sided p-value from the normal distribution. A negative statistic favours a."""
     d = np.asarray(loss_a, dtype=float) - np.asarray(loss_b, dtype=float)
     n = len(d)
     var = newey_west_variance(d, lag)
@@ -359,8 +284,6 @@ def dm_test(loss_a, loss_b, lag: int) -> dict:
 
 
 def dm_tests(fc: pd.DataFrame) -> pd.DataFrame:
-    """Expert against naive and expert_weather against expert, on daily 15-minute MAE, at each
-    Newey-West lag in DM_LAGS."""
     rows = []
     for a, b in (("expert", "naive"), ("expert_weather", "expert")):
         la, lb = daily_mae(fc, a), daily_mae(fc, b)
@@ -368,11 +291,7 @@ def dm_tests(fc: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------- battery value
-
-
 def settle(charge, discharge, dt: float, actual) -> dict:
-    """A schedule paid the actual prices of its periods, with the main spec's wear cost."""
     charge, discharge, actual = (np.asarray(x, dtype=float) for x in (charge, discharge, actual))
     gross = float(np.sum(actual * (discharge - charge)) * dt)
     mwh = float(np.sum(discharge) * dt)
@@ -386,8 +305,6 @@ def settle(charge, discharge, dt: float, actual) -> dict:
 
 
 def day_values(day, actual_q, actual_h, plans: dict[str, np.ndarray]) -> list[dict]:
-    """Rows per duration, model and resolution for one day. ``perfect`` plans on the actual
-    prices; each model in ``plans`` plans on its 15-minute forecast and its hourly means."""
     actual_q, actual_h = np.asarray(actual_q, dtype=float), np.asarray(actual_h, dtype=float)
     rows = []
     for hours in battery.DURATIONS_H:
@@ -409,15 +326,13 @@ def day_values(day, actual_q, actual_h, plans: dict[str, np.ndarray]) -> list[di
 
 
 def check_perfect_bound(daily: pd.DataFrame) -> None:
-    """Raise BuildError if any forecast earns more than perfect foresight on the same day,
-    duration and resolution (beyond BOUND_TOL)."""
     w = daily.pivot(
         index=["delivery_date", "duration_h", "resolution"],
         columns="model",
         values="net_eur_per_mw",
     )
     excess = w[[m for m in w.columns if m != "perfect"]].max(axis=1) - w["perfect"]
-    bad = excess[excess > BOUND_TOL]
+    bad = excess[excess > BOUND_TOL_EUR_PER_MW]
     if len(bad):
         raise BuildError(
             f"{len(bad)} day(s) where a forecast beats perfect foresight, first "
@@ -426,9 +341,6 @@ def check_perfect_bound(daily: pd.DataFrame) -> None:
 
 
 def summarise(daily: pd.DataFrame, models=MODELS) -> pd.DataFrame:
-    """Per duration and model: totals at both resolutions, net capture of perfect foresight at
-    the same resolution, and the 15-minute uplift and its share of the perfect-foresight uplift.
-    A share is NaN when its perfect-foresight total is zero (within 1e-6 EUR/MW)."""
     tot = daily.groupby(["duration_h", "model", "resolution"])[
         ["net_eur_per_mw", "gross_eur_per_mw", "wear_cost_eur_per_mw"]
     ].sum()
@@ -464,11 +376,6 @@ def summarise(daily: pd.DataFrame, models=MODELS) -> pd.DataFrame:
 
 
 def resampled_statistics(daily: pd.DataFrame, idx) -> dict[tuple[int, str, str], np.ndarray]:
-    """Per (duration_h, model, statistic), the statistic on each resample of days (the rows of
-    ``idx``, indices into the sorted days), computed as ``summarise`` computes it: the net
-    capture of perfect foresight at each resolution and the uplift's share of the
-    perfect-foresight uplift as ratios of sums, the uplift in EUR/MW a day as a mean over the
-    days. Also the difference in uplift a day of each pair in UPLIFT_DIFFS, as model "a minus b"."""
     cols = ["duration_h", "model", "resolution"]
     w = daily.pivot(index="delivery_date", columns=cols, values="net_eur_per_mw").sort_index()
     days = idx.shape[1]
@@ -492,9 +399,6 @@ def resampled_statistics(daily: pd.DataFrame, idx) -> dict[tuple[int, str, str],
 
 
 def uncertainty(daily: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
-    """Per duration, model and statistic of ``resampled_statistics``: the value in ``summary``
-    (for a difference, the difference of its values) and its bootstrap interval. Every model,
-    resolution and duration is resampled on the same days."""
     idx = battery.bootstrap_days(daily["delivery_date"].nunique())
     s = summary.set_index(["duration_h", "model"])
     rows = []
@@ -520,15 +424,10 @@ def uncertainty(daily: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def window_sensitivity(pw: pd.DataFrame, hourly: dict) -> tuple[pd.DataFrame, list[date]]:
-    """The expert models fitted on each window in SENSITIVITY_WINDOWS, all evaluated on the days
-    the longest window can forecast, against perfect foresight on the same days. Per duration,
-    model and window: the 15-minute MAE, the net capture of perfect foresight at both resolutions
-    and the 15-minute uplift in EUR/MW a day and as a share of the perfect-foresight uplift.
-    Also returns the evaluation dates."""
     first = first_eval(max(SENSITIVITY_WINDOWS))
     fcs = {win: forecast_periods(pw, win, first) for win in SENSITIVITY_WINDOWS}
     keys = {(m, win): f"{m} {win}d" for win in SENSITIVITY_WINDOWS for m in SENSITIVITY_MODELS}
-    base = fcs[SENSITIVITY_WINDOWS[0]]  # every window's frame has the same rows
+    base = fcs[SENSITIVITY_WINDOWS[0]]
     rows = []
     for day, g in base.groupby("delivery_date", sort=True):
         plans = {k: fcs[win].loc[g.index, m].to_numpy() for (m, win), k in keys.items()}
@@ -556,15 +455,7 @@ def window_sensitivity(pw: pd.DataFrame, hourly: dict) -> tuple[pd.DataFrame, li
     return pd.DataFrame(out), sorted(base["delivery_date"].unique())
 
 
-# ---------------------------------------------------------------- run
-
-
 def load_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Read and check the inputs: the prices with weather columns (sorted by date and period)
-    and the hourly prices. Raises BuildError if a file or column is missing, the weather rows
-    are not the price rows, an hourly price is not the mean of its quarters, the days are not
-    consecutive, there are too few days for one evaluation day of the longest sensitivity
-    window, or a day falls outside the years of the holiday list."""
     ds = data_dir / "dataset"
     paths = {
         "q": ds / "prices_15min.parquet",
@@ -622,8 +513,6 @@ def load_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def run(data_dir: Path) -> dict:
-    """Forecast every evaluation day, value the schedules and write the results to
-    ``data_dir/results/forecast``, all together or not at all. Returns the meta record."""
     started = time.perf_counter()
     pw, h = load_inputs(data_dir)
     fc = forecast_periods(pw)

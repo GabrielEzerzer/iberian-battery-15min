@@ -1,11 +1,4 @@
-"""OMIE day-ahead marginal price files (marginalpdbc): download and parse one file per day.
-
-A file covers one delivery day. Layout (latin-1 text): a ``MARGINALPDBC;`` header line, then
-rows ``year;month;day;period;price_PT;price_ES;`` in EUR/MWh, then a ``*`` trailer line.
-Periods count from local midnight Europe/Madrid. From GO_LIVE a period is 15 minutes, so a
-day has 96 periods (92 or 100 on DST change days); before that a period was one hour.
-"""
-
+# OMIE day-ahead marginal price files (marginalpdbc): download and parse one file per day.
 import math
 import re
 import time
@@ -14,6 +7,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 GO_LIVE = date(2025, 10, 1)
@@ -21,7 +15,6 @@ MADRID = ZoneInfo("Europe/Madrid")
 URL = "https://www.omie.es/es/file-download?parents=marginalpdbc&filename={name}"
 USER_AGENT = "research-client/1.0"
 HEADER = "MARGINALPDBC;"
-# OMIE serves only the latest version of a day's file (.1, .2, ...); seen up to .3 so far.
 MAX_VERSION = 9
 FILE_RE = re.compile(r"^marginalpdbc_(\d{8})\.(\d+)$")
 
@@ -39,16 +32,11 @@ def local_midnight_utc(day: date) -> datetime:
 
 
 def expected_periods(day: date) -> int:
-    """Number of 15-minute periods in a local day: 96, or 92/100 on DST change days."""
     length = local_midnight_utc(day + timedelta(days=1)) - local_midnight_utc(day)
     return int(length / timedelta(minutes=15))
 
 
-# --- download -------------------------------------------------------------------------------
-
-
 def http_get(url: str) -> bytes | None:
-    """GET a URL. Returns the body, or None on 404. Other failures raise."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -63,10 +51,16 @@ class DownloadError(Exception):
     pass
 
 
+class VersionUpdate(NamedTuple):
+    day: date
+    old_version: int
+    new_version: int
+
+
 @dataclass
 class DownloadResult:
     saved: list[tuple[date, int]]
-    updated: list[tuple[date, int, int]]  # (day, old version, new version)
+    updated: list[VersionUpdate]
     up_to_date: list[date]
     not_published: list[date]
     errors: list[tuple[date, str]]
@@ -81,17 +75,6 @@ def download(
     today: date | None = None,
     pause: float = 0.5,
 ) -> DownloadResult:
-    """Download each day's file from start to end (inclusive) into raw_dir, unchanged.
-
-    Sequential, with ``pause`` seconds between requests. OMIE serves only the latest version
-    of a day's file, so for a day already in raw_dir at version v, v is requested again: if it
-    is still served the day is up to date; if not, v+1..MAX_VERSION are tried and the first
-    served replaces the old file. A day not yet in raw_dir tries 1..MAX_VERSION in order. The
-    file name records the version. Every response is validated with the same parser the build
-    uses before it is saved; a bad one is an error and nothing is written. A day after today
-    (Madrid) that has no file yet is reported as not published, not as an error; days more
-    than one day ahead are not requested at all.
-    """
     fetch = fetch or http_get
     today = today or madrid_today()
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -109,7 +92,7 @@ def download(
         requests += 1
         try:
             return fetch(URL.format(name=name))
-        except Exception as e:  # noqa: BLE001 - reported per day at the end
+        except Exception as e:
             raise DownloadError(f"{name}: {type(e).__name__}: {e}") from e
 
     def first_served(day: date, versions: range) -> tuple[int, bytes] | None:
@@ -121,7 +104,7 @@ def download(
 
     def save(day: date, version: int, body: bytes) -> None:
         name = file_name(day, version)
-        parse_day(name, body)  # raises OmieFormatError before anything is written
+        parse_day(name, body)
         tmp = raw_dir / (name + ".part")
         tmp.write_bytes(body)
         tmp.replace(raw_dir / name)
@@ -145,7 +128,7 @@ def download(
                     save(day, version, body)
                     for p in on_disk:
                         p.unlink()
-                    result.updated.append((day, old, version))
+                    result.updated.append(VersionUpdate(day, old, version))
                     print(f"{day} updated version {old} -> {version}")
             elif day > today + timedelta(days=1):
                 result.not_published.append(day)
@@ -167,18 +150,21 @@ def download(
     return result
 
 
-# --- parse ----------------------------------------------------------------------------------
-
-
 class OmieFormatError(ValueError):
     pass
+
+
+class PriceRow(NamedTuple):
+    period: int
+    price_pt: float
+    price_es: float
 
 
 @dataclass
 class DayFile:
     day: date
     version: int
-    rows: list[tuple[int, float, float]]  # (period, price_pt, price_es), sorted by period
+    rows: list[PriceRow]
 
 
 def _price(text: str, name: str, lineno: int) -> float:
@@ -192,12 +178,10 @@ def _price(text: str, name: str, lineno: int) -> float:
 
 
 def read_day(path: Path) -> DayFile:
-    """Parse and validate one raw file. Raises OmieFormatError with the file name on any fault."""
     return parse_day(path.name, path.read_bytes())
 
 
 def parse_day(name: str, data: bytes) -> DayFile:
-    """Parse and validate one file's name and bytes. Raises OmieFormatError on any fault."""
     m = FILE_RE.match(name)
     if not m:
         raise OmieFormatError(f"{name}: unexpected file name")
@@ -254,4 +238,4 @@ def parse_day(name: str, data: bytes) -> DayFile:
             f"{name}: wrong period count, expected {n} for this day, got {len(rows)}"
             f" (missing {missing[:10]}, unexpected {extra[:10]})"
         )
-    return DayFile(day, version, [(p, *rows[p]) for p in sorted(rows)])
+    return DayFile(day, version, [PriceRow(p, *rows[p]) for p in sorted(rows)])

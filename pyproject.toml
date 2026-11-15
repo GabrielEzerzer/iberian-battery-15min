@@ -17,6 +17,7 @@ ib15 = "ib15.cli:main"
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.170.15",
     "pytest>=8",
     "ruff>=0.6",
 ]
@@ -27,6 +28,7 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 100
+extend-exclude = ["setup/lint"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]

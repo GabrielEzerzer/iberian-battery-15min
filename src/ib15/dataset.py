@@ -1,5 +1,4 @@
-"""Build the price dataset from the raw OMIE files."""
-
+# Build the price dataset from the raw OMIE files.
 import json
 import subprocess
 from datetime import timedelta
@@ -25,8 +24,6 @@ class BuildError(Exception):
 
 
 def load_days(raw_dir: Path) -> list[DayFile]:
-    """Read every raw file, validate each one and the day sequence. Raises BuildError listing
-    every problem found."""
     if not raw_dir.is_dir():
         raise BuildError(f"raw directory {raw_dir} does not exist")
     paths = sorted(p for p in raw_dir.iterdir() if FILE_RE.match(p.name))
@@ -60,8 +57,6 @@ def load_days(raw_dir: Path) -> list[DayFile]:
 
 
 def quarter_hours(days: list[DayFile]) -> pd.DataFrame:
-    """One row per 15-minute delivery period. The UTC start is local midnight (Europe/Madrid)
-    in UTC plus (period - 1) * 15 minutes, which stays correct on DST change days."""
     records = []
     for d in days:
         midnight = local_midnight_utc(d.day)
@@ -84,10 +79,6 @@ def quarter_hours(days: list[DayFile]) -> pd.DataFrame:
 
 
 def hourly_benchmark(q: pd.DataFrame) -> pd.DataFrame:
-    """Constructed hourly benchmark: each hour is the arithmetic mean of exactly its four
-    quarter-hours (consecutive groups of four periods from local midnight); ``period`` is the
-    1-based hour index. This is built from the 15-minute prices, not OMIE's own hourly product.
-    """
     h = q.assign(period=(q["period"] - 1) // 4 + 1)
     g = h.groupby(["delivery_date", "period"], sort=True)
     if not (g.size() == 4).all():
@@ -112,8 +103,6 @@ def _git(*args: str) -> str | None:
 
 
 def coverage(days: list[DayFile], q: pd.DataFrame) -> dict:
-    # Validation already rejects missing or duplicate periods, so these counts are 0 in any
-    # dataset that was written; they are recorded so the file states it.
     status = _git("status", "--porcelain")
     return {
         "date_range": {"start": days[0].day.isoformat(), "end": days[-1].day.isoformat()},
@@ -140,7 +129,6 @@ def coverage(days: list[DayFile], q: pd.DataFrame) -> dict:
 
 
 def build(data_dir: Path) -> dict:
-    """Validate the raw files and write the dataset. Nothing is written if validation fails."""
     days = load_days(data_dir / "raw" / "omie")
     q = quarter_hours(days)
     h = hourly_benchmark(q)

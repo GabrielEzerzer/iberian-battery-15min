@@ -14,17 +14,12 @@ def fixture_text(name):
 
 
 def day_text(day):
-    """The real 2025-10-01 file relabelled to another 96-period day."""
     assert expected_periods(day) == 96
     return fixture_text("marginalpdbc_20251001.1").replace("2025;10;01;", f"{day:%Y;%m;%d};")
 
 
 @pytest.fixture
 def data_dir(tmp_path):
-    """An empty data dir with raw/omie. data_dir.add(name, text=None) copies a fixture into
-    raw/omie, or writes the given text under that name. data_dir.fill(until) adds a version 1
-    file for every day from GO_LIVE up to the day before ``until``: the real fixture where
-    there is one, otherwise day_text."""
     raw = tmp_path / "raw" / "omie"
     raw.mkdir(parents=True)
 

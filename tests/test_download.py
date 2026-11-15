@@ -17,8 +17,6 @@ def body(day):
 
 
 class FakeOmie:
-    """Stands in for http_get: maps file name -> body, None (404) or an exception."""
-
     def __init__(self, files, log=None):
         self.files = files
         self.requested = []
@@ -49,7 +47,7 @@ def test_falls_back_to_version_2_when_1_is_404(tmp_path):
     r = run(tmp_path, fake, date(2025, 11, 27), date(2025, 11, 27))
     assert fake.requested == ["marginalpdbc_20251127.1", "marginalpdbc_20251127.2"]
     assert r.saved == [(date(2025, 11, 27), 2)] and not r.errors
-    assert (tmp_path / "marginalpdbc_20251127.2").read_bytes() == nov27  # saved unchanged
+    assert (tmp_path / "marginalpdbc_20251127.2").read_bytes() == nov27
     assert names(tmp_path) == ["marginalpdbc_20251127.2"]
 
 
@@ -59,7 +57,6 @@ def test_day_on_disk_still_served_is_up_to_date(tmp_path):
         {"marginalpdbc_20251001.3": BODY, "marginalpdbc_20251002.1": body(date(2025, 10, 2))}
     )
     r = run(tmp_path, fake, date(2025, 10, 1), date(2025, 10, 2))
-    # The version on disk is requested again; still served means no newer one exists.
     assert fake.requested == ["marginalpdbc_20251001.3", "marginalpdbc_20251002.1"]
     assert r.up_to_date == [date(2025, 10, 1)] and not r.updated and not r.errors
     assert r.saved == [(date(2025, 10, 2), 1)]
@@ -78,7 +75,6 @@ def test_newer_version_replaces_the_old_file(tmp_path):
 
 
 def test_newer_version_found_past_a_404_version(tmp_path):
-    # OMIE serves only the latest version: going from .1 to .3, .2 is a 404 as well.
     (tmp_path / "marginalpdbc_20251030.1").write_bytes(body(date(2025, 10, 30)))
     fake = FakeOmie({"marginalpdbc_20251030.3": body(date(2025, 10, 30))})
     r = run(tmp_path, fake, date(2025, 10, 30), date(2025, 10, 30))
@@ -122,11 +118,10 @@ def test_sleeps_between_consecutive_requests(tmp_path, monkeypatch):
 
 
 def test_future_day_is_reported_not_published(tmp_path):
-    fake = FakeOmie({})  # every version 404
+    fake = FakeOmie({})
     r = run(tmp_path, fake, date(2026, 11, 8), date(2026, 11, 10))
     assert r.not_published == [date(2026, 11, 8), date(2026, 11, 9), date(2026, 11, 10)]
     assert not r.errors and not r.saved
-    # Tomorrow is tried; days after it cannot be published yet and are not requested.
     assert fake.requested
     assert all(n.startswith("marginalpdbc_20261108.") for n in fake.requested)
 

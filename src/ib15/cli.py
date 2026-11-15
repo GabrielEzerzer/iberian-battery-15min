@@ -1,6 +1,5 @@
-"""Command line: ``ib15 download omie|weather``, ``ib15 build [prices|weather]`` and
-``ib15 perfect-foresight``, ``ib15 eda`` and ``ib15 forecast``."""
-
+# Command line: ib15 download omie|weather, ib15 build [prices|weather], ib15 perfect-foresight,
+# ib15 eda and ib15 forecast.
 import argparse
 import os
 import sys
@@ -22,7 +21,6 @@ def _data_dir(arg: str | None) -> Path:
 def _download(args) -> int:
     data_dir = _data_dir(args.data_dir)
     start = args.start or omie.GO_LIVE
-    # D+1 is published around 13:00 Madrid time; before that, tomorrow reports as not published.
     end = args.end or omie.madrid_today() + timedelta(days=1)
     if start < omie.GO_LIVE:
         raise SystemExit(f"error: --start {start} is before {omie.GO_LIVE}, out of scope")
@@ -44,7 +42,6 @@ def _download(args) -> int:
 
 
 def _latest_price_day(data_dir: Path):
-    """The latest delivery day among the raw OMIE files, or None if there are none."""
     raw = data_dir / "raw" / "omie"
     days = [m.group(1) for p in raw.glob("marginalpdbc_*") if (m := omie.FILE_RE.match(p.name))]
     return datetime.strptime(max(days), "%Y%m%d").date() if days else None
@@ -52,7 +49,6 @@ def _latest_price_day(data_dir: Path):
 
 def _download_weather(args) -> int:
     data_dir = _data_dir(args.data_dir)
-    # The first price day starts at 22:00 UTC the day before (local midnight in Madrid).
     start = args.start or omie.GO_LIVE - timedelta(days=1)
     end = args.end or _latest_price_day(data_dir) or omie.madrid_today() + timedelta(days=1)
     if end < start:

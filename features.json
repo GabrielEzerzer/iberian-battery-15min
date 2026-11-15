@@ -1,0 +1,87 @@
+[
+  {
+    "name": "Download OMIE prices",
+    "description": "Saves each day's OMIE day-ahead marginal price file unchanged, re-checking saved days for newer versions.",
+    "command": "ib15 download omie",
+    "inputs": ["OMIE public file download (network)", "--start, --end (optional)", "--data-dir or IB15_DATA_DIR"],
+    "outputs": ["raw/omie/marginalpdbc_YYYYMMDD.N"],
+    "test": "tests/test_download.py"
+  },
+  {
+    "name": "Build the price dataset",
+    "description": "Validates every raw OMIE file and writes the 15-minute prices, the hourly benchmark and a coverage record.",
+    "command": "ib15 build",
+    "inputs": ["raw/omie/marginalpdbc_*", "--data-dir or IB15_DATA_DIR"],
+    "outputs": ["dataset/prices_15min.parquet", "dataset/prices_hourly.parquet", "dataset/coverage.json"],
+    "test": "tests/test_dataset.py"
+  },
+  {
+    "name": "Download weather forecasts",
+    "description": "Saves Open-Meteo's archived ECMWF IFS forecasts at a 48-hour lead for ten locations, one file per location and month.",
+    "command": "ib15 download weather",
+    "inputs": ["Open-Meteo Previous Runs API (network)", "--start, --end (optional, UTC dates)", "raw/omie (default end)", "--data-dir or IB15_DATA_DIR"],
+    "outputs": ["raw/openmeteo/<location>.ecmwf_ifs025.<start>.<end>.json"],
+    "test": "tests/test_weather_download.py"
+  },
+  {
+    "name": "Build the weather dataset",
+    "description": "Validates the raw forecasts, checks each was public before the bid deadline and joins them to the 15-minute prices.",
+    "command": "ib15 build weather",
+    "inputs": ["dataset/prices_15min.parquet", "raw/openmeteo/*.json", "--data-dir or IB15_DATA_DIR"],
+    "outputs": ["dataset/weather_hourly.parquet", "dataset/prices_weather_15min.parquet", "dataset/weather_coverage.json"],
+    "test": "tests/test_weather_build.py"
+  },
+  {
+    "name": "Perfect-foresight battery value",
+    "description": "Solves the most a 1 MW battery could earn each day at 15-minute and hourly prices, with uncertainty, a wear-cost sensitivity and a Portuguese check.",
+    "command": "ib15 perfect-foresight",
+    "inputs": ["dataset/prices_15min.parquet", "dataset/prices_hourly.parquet", "--data-dir or IB15_DATA_DIR"],
+    "outputs": [
+      "results/perfect_foresight_daily.parquet",
+      "results/perfect_foresight_summary.csv",
+      "results/perfect_foresight_cost_sensitivity.csv",
+      "results/perfect_foresight_uncertainty.csv",
+      "results/perfect_foresight_portugal.csv",
+      "results/perfect_foresight_meta.json"
+    ],
+    "test": "tests/test_battery.py"
+  },
+  {
+    "name": "Exploratory analysis",
+    "description": "Writes the tables and figures that describe the prices, the weather and where the 15-minute value comes from.",
+    "command": "ib15 eda",
+    "inputs": [
+      "dataset/prices_15min.parquet",
+      "dataset/prices_hourly.parquet",
+      "dataset/weather_hourly.parquet",
+      "results/perfect_foresight_daily.parquet",
+      "results/perfect_foresight_cost_sensitivity.csv (optional)",
+      "--data-dir or IB15_DATA_DIR"
+    ],
+    "outputs": ["results/eda/*.csv", "results/eda/fig_*.png", "results/eda/fig_*.pdf", "results/eda/eda_meta.json"],
+    "test": "tests/test_eda.py"
+  },
+  {
+    "name": "Bid-time forecast",
+    "description": "Forecasts each day's prices from data public before the bid, values the battery planned on them at actual prices and compares with perfect foresight.",
+    "command": "ib15 forecast",
+    "inputs": [
+      "dataset/prices_15min.parquet",
+      "dataset/prices_hourly.parquet",
+      "dataset/prices_weather_15min.parquet",
+      "--data-dir or IB15_DATA_DIR"
+    ],
+    "outputs": [
+      "results/forecast/forecasts_15min.parquet",
+      "results/forecast/forecast_errors.csv",
+      "results/forecast/forecast_dm_tests.csv",
+      "results/forecast/forecast_value_daily.parquet",
+      "results/forecast/forecast_value_summary.csv",
+      "results/forecast/forecast_uncertainty.csv",
+      "results/forecast/forecast_regret_drivers.csv",
+      "results/forecast/forecast_window_sensitivity.csv",
+      "results/forecast/forecast_meta.json"
+    ],
+    "test": "tests/test_forecast.py"
+  }
+]
