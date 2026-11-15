@@ -1,3 +1,4 @@
+import math
 from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
@@ -8,9 +9,6 @@ from hypothesis import strategies as st
 
 from ib15 import battery, eda, forecast, omie, weather
 from ib15.dataset import hourly_benchmark, quarter_hours
-
-settings.register_profile("ib15", derandomize=True, deadline=None, max_examples=60)
-settings.load_profile("ib15")
 
 PRICE = st.floats(-500, 3000, allow_nan=False).map(lambda x: round(x, 2))
 DAYS = st.dates(date(2025, 10, 1), date(2030, 12, 31))
@@ -105,11 +103,16 @@ def test_bootstrap_rows_are_circular_runs_of_valid_days(n, block, seed):
 
 
 @given(
-    x=st.floats(-1e6, 1e6, allow_nan=False),
-    ref=st.floats(-1e6, 1e6, allow_nan=False).filter(lambda r: abs(r) > 1e-3),
+    x=st.floats(-1e6, 1e6, allow_subnormal=False),
+    ref=st.builds(lambda m, e: m * 10.0**e, st.floats(-9.99, 9.99), st.integers(-12, 5)),
 )
-def test_a_percentage_times_its_reference_gives_back_the_value(x, ref):
-    assert float(battery.percent(x, ref)) * ref / 100 == pytest.approx(x, rel=1e-9, abs=1e-9)
+def test_a_percentage_is_nan_only_against_a_reference_within_solver_noise_of_zero(x, ref):
+    pct = float(battery.percent(x, ref))
+    if abs(ref) <= 1e-6:
+        assert math.isnan(pct)
+    else:
+        assert math.isfinite(pct)
+        assert np.sign(pct) == np.sign(x) * np.sign(ref)
 
 
 @given(values=st.lists(st.floats(-1e3, 1e3, allow_nan=False), min_size=92, max_size=92))

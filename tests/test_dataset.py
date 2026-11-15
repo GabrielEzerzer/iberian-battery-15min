@@ -91,8 +91,9 @@ def test_coverage_records_non_v1_day(data_dir):
 def test_es_and_pt_prices_land_in_their_columns(data_dir):
     q, _, _ = built(data_dir, ["marginalpdbc_20251001.1"])
     rows = q.set_index("period")
-    assert (rows.loc[40, "price_es"], rows.loc[40, "price_pt"]) == (60.0, 60.87)
-    assert (rows.loc[73, "price_es"], rows.loc[73, "price_pt"]) == (59.07, 60.0)
+    from_the_file = "marginalpdbc_20251001.1: period 40 is PT 60.87, ES 60; 73 is PT 60, ES 59.07"
+    assert (rows.loc[40, "price_es"], rows.loc[40, "price_pt"]) == (60.0, 60.87), from_the_file
+    assert (rows.loc[73, "price_es"], rows.loc[73, "price_pt"]) == (59.07, 60.0), from_the_file
 
 
 def _with_period_5(edit):

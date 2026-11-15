@@ -127,17 +127,17 @@ def test_each_sensitivity_window_reaches_back_exactly_its_length_plus_7_days(lon
 @pytest.mark.parametrize(
     "day, lag",
     [
-        (date(2026, 1, 12), 7),
-        (date(2026, 1, 17), 7),
-        (date(2026, 1, 18), 7),
-        (date(2026, 1, 14), 1),
-        (date(2025, 12, 8), 1),
-        (date(2025, 12, 6), 6),
-        (date(2025, 12, 25), 4),
-        (date(2026, 1, 6), 2),
-        (date(2025, 12, 9), 1),
-        (date(2025, 12, 26), 1),
-        (date(2026, 1, 7), 1),
+        pytest.param(date(2026, 1, 12), 7, id="monday"),
+        pytest.param(date(2026, 1, 17), 7, id="saturday"),
+        pytest.param(date(2026, 1, 18), 7, id="sunday"),
+        pytest.param(date(2026, 1, 14), 1, id="wednesday"),
+        pytest.param(date(2025, 12, 8), 1, id="monday-holiday-copies-last-sunday-7-dec"),
+        pytest.param(date(2025, 12, 6), 6, id="saturday-holiday-copies-last-sunday-30-nov"),
+        pytest.param(date(2025, 12, 25), 4, id="thursday-holiday-copies-last-sunday-21-dec"),
+        pytest.param(date(2026, 1, 6), 2, id="tuesday-holiday-copies-last-sunday-4-jan"),
+        pytest.param(date(2025, 12, 9), 1, id="tuesday-after-holiday-follows-ordinary-rule"),
+        pytest.param(date(2025, 12, 26), 1, id="friday-after-holiday-follows-ordinary-rule"),
+        pytest.param(date(2026, 1, 7), 1, id="wednesday-after-holiday-follows-ordinary-rule"),
     ],
 )
 def test_naive_rule(long_frame, day, lag):
@@ -148,10 +148,10 @@ def test_naive_rule(long_frame, day, lag):
 @pytest.mark.parametrize(
     "day, dummies",
     [
-        (date(2025, 12, 8), (0, 0, 1)),
-        (date(2025, 12, 25), (0, 0, 1)),
-        (date(2025, 12, 15), (1, 0, 0)),
-        (date(2025, 12, 18), (0, 0, 0)),
+        pytest.param(date(2025, 12, 8), (0, 0, 1), id="monday-holiday"),
+        pytest.param(date(2025, 12, 25), (0, 0, 1), id="thursday-holiday"),
+        pytest.param(date(2025, 12, 15), (1, 0, 0), id="ordinary-monday"),
+        pytest.param(date(2025, 12, 18), (0, 0, 0), id="ordinary-thursday"),
     ],
 )
 def test_a_holiday_has_the_sunday_dummies(long_frame, day, dummies):
@@ -305,7 +305,10 @@ def test_error_metrics_match_hand_computed_values():
 def test_diebold_mariano_matches_hand_computed_values():
     r = forecast.dm_test([1, 2, 3, 4], [2, 2, 2, 2], lag=1)
     assert r["mean_loss_diff"] == pytest.approx(0.5)
-    assert r["dm_stat"] == pytest.approx(0.8)
+    assert r["dm_stat"] == pytest.approx(0.8), (
+        "d = -1, 0, 1, 2: mean 0.5, gamma0 1.25, gamma1 0.3125; lag 1 weight 1/2 gives variance "
+        "1.5625, so the statistic is 0.5 / sqrt(1.5625 / 4) = 0.8"
+    )
     assert r["p_value"] == pytest.approx(0.4237107971, abs=1e-9)
     assert r["n_days"] == 4
     assert forecast.newey_west_variance([-1, 0, 1, 2], 1) == pytest.approx(1.5625)
@@ -401,20 +404,27 @@ def test_run_writes_every_output(tmp_path):
     assert set(files_in(out)) == OUTPUTS
     meta = json.loads((out / "forecast_meta.json").read_text(encoding="utf-8"))
     days = NDAYS - forecast.FIRST_EVAL
-    assert meta["evaluation"]["start"] == str(START + timedelta(days=63))
-    assert meta["evaluation"]["days"] == days
+    assert (meta["evaluation"]["start"], meta["evaluation"]["days"]) == (
+        str(START + timedelta(days=63)),
+        days,
+    ), "the main evaluation runs from 8 October to Sunday 7 December 2025 (61 days)"
     assert meta["holidays"]["dates"] == [str(d) for d in forecast.HOLIDAYS]
     assert meta["dm_test"]["lag_days"] == 7
     assert meta["dm_test"]["sensitivity_lags_days"] == [7, 14, 28]
     sens_meta = meta["window_sensitivity"]
     assert sens_meta["windows_days"] == [28, 56, 112]
-    assert (sens_meta["start"], sens_meta["days"]) == ("2025-12-03", 5)
+    assert (sens_meta["start"], sens_meta["days"]) == ("2025-12-03", 5), (
+        "the window sensitivity runs from Wednesday 3 December (5 days)"
+    )
     fc = pd.read_parquet(out / "forecasts_15min.parquet")
     assert fc["delivery_date"].nunique() == days and set(MODELS) <= set(fc.columns)
     pw = pd.read_parquet(tmp_path / "dataset" / "prices_weather_15min.parquet")
     for day, lag in ((date(2025, 12, 5), 1), (date(2025, 12, 6), 6), (date(2025, 12, 7), 7)):
         got = fc.loc[fc["delivery_date"] == day, "naive"].to_numpy()
-        assert np.array_equal(got, day_prices(pw, day - timedelta(days=lag))), day
+        assert np.array_equal(got, day_prices(pw, day - timedelta(days=lag))), (
+            f"{day}: D-1 on Friday, the last Sunday on the Saturday holiday 6 December, "
+            "D-7 on Sunday"
+        )
     s = pd.read_csv(out / "forecast_value_summary.csv")
     assert len(s) == len(battery.DURATIONS_H) * 4
     perfect = s[s["model"] == "perfect"]
@@ -606,12 +616,18 @@ def test_every_model_is_resampled_on_the_same_days():
         ["duration_h", "model", "statistic"]
     )
     diff = unc.loc[(2, "expert minus naive", "net_uplift_eur_per_mw_day")]
-    assert diff[["estimate", "ci_low", "ci_high"]].tolist() == pytest.approx([3, 3, 3])
+    assert diff[["estimate", "ci_low", "ci_high"]].tolist() == pytest.approx([3, 3, 3]), (
+        "expert = naive + 3 every day, so the paired difference is 3 on every resample only if "
+        "both are resampled on the same days"
+    )
     own = unc.loc[(2, "naive", "net_uplift_eur_per_mw_day")]
     assert own["ci_high"] - own["ci_low"] > 2
     for stat in ("net_capture_15min_pct", "net_capture_hourly_pct", "net_uplift_capture_pct"):
         row = unc.loc[(2, "naive", stat)]
-        assert row[["estimate", "ci_low", "ci_high"]].tolist() == pytest.approx([50, 50, 50])
+        assert row[["estimate", "ci_low", "ci_high"]].tolist() == pytest.approx([50, 50, 50]), (
+            f"{stat}: perfect = 2 x naive, so naive's share is 50 on every resample only if the "
+            "benchmark is resampled on the same days"
+        )
 
 
 def test_kendall_tau_matches_hand_computed_values():
@@ -627,7 +643,10 @@ def test_kendall_tau_matches_hand_computed_values():
         }
     )
     tau = forecast.daily_tau(fc, "naive")
-    assert tau.tolist() == pytest.approx([4 / 6, 4 / np.sqrt(24)])
+    assert tau.tolist() == pytest.approx([4 / 6, 4 / np.sqrt(24)]), (
+        "day 1: 5 concordant pairs and 1 discordant give 4/6; day 2: 4 concordant and 2 tied in "
+        "the forecast give tau-b 4 / sqrt(6 * 4)"
+    )
     e = forecast.errors(fc).set_index("model")["mean_daily_kendall_tau"]
     assert e["naive"] == pytest.approx((4 / 6 + 4 / np.sqrt(24)) / 2)
     assert e[["expert", "expert_weather"]].tolist() == pytest.approx([1, -1])
@@ -655,10 +674,23 @@ def test_regret_drivers_match_hand_computed_values():
     d = forecast.regret_drivers(fc, daily).set_index(["duration_h", "model"])
     for hours in battery.DURATIONS_H:
         for m in MODELS:
-            assert d.loc[(hours, m), "spearman_regret_mae"] == pytest.approx(0.2)
-            assert d.loc[(hours, m), "spearman_regret_tau"] == pytest.approx(-1 / np.sqrt(10))
+            assert d.loc[(hours, m), "spearman_regret_mae"] == pytest.approx(0.2), (
+                "ranks of regret 3, 1, 2, 4 and of daily MAE 1, 5, 2, 20 (ranks 1, 3, 2, 4): "
+                "1 - 6 * 8 / (4 * 15) = 0.2"
+            )
+            assert d.loc[(hours, m), "spearman_regret_tau"] == pytest.approx(-1 / np.sqrt(10)), (
+                "daily tau 1, 4/6, 1, -1 has ranks 3.5, 2, 3.5, 1: Pearson of the ranks "
+                "-1.5 / sqrt(5 * 4.5)"
+            )
             assert d.loc[(hours, m), ["days", "observations"]].tolist() == [4, 4]
         pooled = d.loc[(hours, "pooled")]
-        assert pooled["spearman_regret_mae"] == pytest.approx(9 / np.sqrt(143 * 135))
-        assert pooled["spearman_regret_tau"] == pytest.approx(-13.5 / np.sqrt(143 * 121.5))
+        assert pooled["spearman_regret_mae"] == pytest.approx(9 / np.sqrt(143 * 135)), (
+            "pooled over 12 days: regret ranks 1..12 (sum of squared deviations 143); MAE ranks "
+            "2, 8, 5, 11 for each model (deviations -4.5, 1.5, -1.5, 4.5; squares 135 over 12); "
+            "cross sum 3 * (3 * -4.5 + 1 * 1.5 + 2 * -1.5 + 4 * 4.5) = 9"
+        )
+        assert pooled["spearman_regret_tau"] == pytest.approx(-13.5 / np.sqrt(143 * 121.5)), (
+            "pooled tau ranks 9.5, 5, 9.5, 2 (deviations 3, -1.5, 3, -4.5; squares 121.5): "
+            "cross sum 3 * -4.5 = -13.5"
+        )
         assert pooled[["days", "observations"]].tolist() == [4, 12]

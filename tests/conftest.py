@@ -3,10 +3,14 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from hypothesis import settings
 
 from ib15.omie import GO_LIVE, expected_periods, file_name
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+settings.register_profile("ib15", derandomize=True, deadline=None, max_examples=60)
+settings.load_profile("ib15")
 
 
 def fixture_text(name):

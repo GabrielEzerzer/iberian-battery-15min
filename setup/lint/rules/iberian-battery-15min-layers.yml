@@ -22,7 +22,9 @@ rule:
     - kind: import_from_statement
       regex: '^from\s+(ib15\b|\.)'
       not:
-        regex: '^from\s+ib15\.omie\s+import\b'
+        any:
+          - regex: '^from\s+(ib15)?\.omie\s+import\b'
+          - regex: '(?s)^from\s+(ib15|\.)\s+import\s+\(?\s*omie(\s+as\s+\w+)?\s*,?\s*\)?\s*$'
     - kind: import_statement
       regex: '^import\s+ib15\b'
       not:
@@ -40,7 +42,9 @@ rule:
     - kind: import_from_statement
       regex: '^from\s+(ib15\b|\.)'
       not:
-        regex: '^from\s+ib15\.(omie|dataset)\s+import\b'
+        any:
+          - regex: '^from\s+(ib15)?\.(omie|dataset)\s+import\b'
+          - regex: '(?s)^from\s+(ib15|\.)\s+import\s+\(?\s*(omie|dataset)(\s+as\s+\w+)?(\s*,\s*(omie|dataset)(\s+as\s+\w+)?)*\s*,?\s*\)?\s*$'
     - kind: import_statement
       regex: '^import\s+ib15\b'
       not:
@@ -55,9 +59,9 @@ files:
 rule:
   any:
     - kind: import_from_statement
-      regex: '^from\s+ib15\.(forecast|cli|__main__)\b'
+      regex: '^from\s+(ib15)?\.(forecast|cli|__main__)\b'
     - kind: import_from_statement
-      regex: '^from\s+(ib15|\.)\s+import\b.*\b(forecast|cli|__main__)\b'
+      regex: '(?s)^from\s+(ib15|\.)\s+import\b.*\b(forecast|cli|__main__)\b'
     - kind: import_statement
       regex: '^import\s+ib15\.(forecast|cli|__main__)\b'
 ---
@@ -73,9 +77,9 @@ ignores:
 rule:
   any:
     - kind: import_from_statement
-      regex: '^from\s+ib15\.(cli|__main__)\b'
+      regex: '^from\s+(ib15)?\.(cli|__main__)\b'
     - kind: import_from_statement
-      regex: '^from\s+(ib15|\.)\s+import\b.*\b(cli|__main__)\b'
+      regex: '(?s)^from\s+(ib15|\.)\s+import\b.*\b(cli|__main__)\b'
     - kind: import_statement
       regex: '^import\s+ib15\.(cli|__main__)\b'
 ---
@@ -105,7 +109,7 @@ rule:
     - kind: import_from_statement
       regex: '^from\s+(urllib\.request|urllib\.error|http\.client|socket|requests|httpx|aiohttp|urllib3)\b'
     - kind: import_from_statement
-      regex: '^from\s+(urllib|http)\s+import\b.*\b(request|error|client)\b'
+      regex: '(?s)^from\s+(urllib|http)\s+import\b.*\b(request|error|client)\b'
     - kind: import_statement
       regex: '^import\s+(urllib\.request|urllib\.error|http\.client|socket|requests|httpx|aiohttp|urllib3)\b'
 ---
@@ -124,7 +128,7 @@ rule:
     - kind: import_from_statement
       regex: '^from\s+argparse\s+import\b'
     - kind: import_from_statement
-      regex: '^from\s+os\s+import\b.*\b(environ|getenv)\b'
+      regex: '(?s)^from\s+os\s+import\b.*\b(environ|getenv)\b'
     - kind: attribute
       regex: '^os\.(environ|getenv)$'
 ---
@@ -158,7 +162,7 @@ rule:
     - kind: import_from_statement
       regex: '^from\s+scipy\.optimize\b'
     - kind: import_from_statement
-      regex: '^from\s+scipy\s+import\b.*\boptimize\b'
+      regex: '(?s)^from\s+scipy\s+import\b.*\boptimize\b'
 ---
 id: ib15-tests-load-fixtures-through-conftest
 language: Python

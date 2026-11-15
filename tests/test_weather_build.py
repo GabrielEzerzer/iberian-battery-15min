@@ -279,9 +279,21 @@ def test_latest_run_matches_the_previous_day2_construction():
 @pytest.mark.parametrize(
     "day, last_hour, deadline",
     [
-        (date(2025, 10, 26), utc(2025, 10, 26, 22), utc(2025, 10, 25, 10)),
-        (date(2026, 3, 29), utc(2026, 3, 29, 21), utc(2026, 3, 28, 11)),
-        (date(2026, 7, 15), utc(2026, 7, 15, 21), utc(2026, 7, 14, 10)),
+        pytest.param(
+            date(2025, 10, 26),
+            utc(2025, 10, 26, 22),
+            utc(2025, 10, 25, 10),
+            id="25h-day-23h-cet-is-22-utc-d-1-still-cest-deadline-10-utc",
+        ),
+        pytest.param(
+            date(2026, 3, 29),
+            utc(2026, 3, 29, 21),
+            utc(2026, 3, 28, 11),
+            id="23h-day-23h-cest-is-21-utc-d-1-cet-deadline-11-utc",
+        ),
+        pytest.param(
+            date(2026, 7, 15), utc(2026, 7, 15, 21), utc(2026, 7, 14, 10), id="summer-day"
+        ),
     ],
 )
 def test_bid_time_rule_for_the_last_hour_of_the_day(day, last_hour, deadline):
@@ -308,21 +320,34 @@ def test_build_check_fails_when_a_run_is_published_too_late(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "start",
+    "start, newest_label",
     [
-        "2026-03-30 21:45",
-        "2026-03-30 20:15",
+        pytest.param(
+            "2026-03-30 21:45",
+            "21 UTC, the last hour of 2026-03-30 (CEST): radiation's label 22:00 interpolates "
+            "towards 03:00 next day (run 00 UTC D-1); the own label 21:00 is a grid point "
+            "(run 18 UTC D-2)",
+            id="radiation-label-newer",
+        ),
+        pytest.param(
+            "2026-03-30 20:15",
+            "20 UTC: the own label 20:00 interpolates towards 00:00 next day (run 00 UTC D-1); "
+            "radiation's label 21:00 is a grid point (run 18 UTC D-2)",
+            id="own-label-newer",
+        ),
     ],
-    ids=["radiation-label-newer", "own-label-newer"],
 )
-def test_build_check_takes_the_newest_run_of_either_label(start):
+def test_build_check_takes_the_newest_run_of_either_label(start, newest_label):
     one = pd.DataFrame(
         {
             "delivery_start_utc": [pd.Timestamp(start, tz=UTC)],
             "delivery_date": [date(2026, 3, 30)],
         }
     )
-    assert weather.check_bid_time(one) == pytest.approx(2.0)
+    assert weather.check_bid_time(one) == pytest.approx(2.0), (
+        f"{newest_label}; deadline 10:00 UTC on 2026-03-29 (CEST), and the 00 UTC run of that "
+        "day is public at 08:00"
+    )
 
 
 @pytest.fixture

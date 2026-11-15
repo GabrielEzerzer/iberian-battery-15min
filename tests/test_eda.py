@@ -117,12 +117,21 @@ def test_one_cycle_spread_by_hand():
     for market, k in (("es", 1), ("pt", 2)):
         r = t.loc[(market, "oct_nov_2025")]
         assert (r["start"], r["end"], r["days"]) == (days[0], days[1], 2)
-        assert r["spread_15min_eur_per_mwh"] == pytest.approx(k * (62.5 + 80) / 2)
-        assert r["spread_hourly_eur_per_mwh"] == pytest.approx(k * (25 + 80) / 2)
+        assert r["spread_15min_eur_per_mwh"] == pytest.approx(k * (62.5 + 80) / 2), (
+            "2025-11-30: four quarter-hours at 0 in different hours and one at 100, the rest 50; "
+            "the four highest quarters average 62.5 and the four lowest 0, so 62.5; 2025-10-26: "
+            "first hour at 10 and the 25th hour at 90, so 80"
+        )
+        assert r["spread_hourly_eur_per_mwh"] == pytest.approx(k * (25 + 80) / 2), (
+            "2025-11-30: hourly means 37.5 for the hours with a 0 and 62.5 for the hour with the "
+            "100, so 62.5 - 37.5 = 25; 2025-10-26: 80"
+        )
         assert r["uplift_pct"] == pytest.approx(100 * (142.5 / 105 - 1))
         r = t.loc[(market, "full")]
         assert (r["start"], r["end"], r["days"]) == (days[0], days[2], 3)
-        assert r["spread_15min_eur_per_mwh"] == pytest.approx(k * 152.5 / 3)
+        assert r["spread_15min_eur_per_mwh"] == pytest.approx(k * 152.5 / 3), (
+            "2025-12-01, outside oct_nov_2025: one quarter at 30 and one at 70, both spreads 10"
+        )
         assert r["spread_hourly_eur_per_mwh"] == pytest.approx(k * 115 / 3)
         assert r["uplift_pct"] == pytest.approx(100 * (152.5 / 115 - 1))
 
@@ -173,7 +182,10 @@ def test_uplift_by_month_percent_is_a_ratio_of_sums():
     assert (row["month"], row["duration_h"], row["days"]) == ("2025-10", 2, 2)
     assert row["uplift_eur_per_mw"] == pytest.approx(25.0)
     assert row["uplift_eur_per_mw_day"] == pytest.approx(12.5)
-    assert row["uplift_pct"] == pytest.approx(6.25)
+    assert row["uplift_pct"] == pytest.approx(6.25), (
+        "daily uplifts of 10% and 5% average 7.5%, but over the month the 15-minute value is "
+        "(110 + 315) / (100 + 300) of hourly"
+    )
     assert row["mean_within_hour_spread"] == pytest.approx(20.0)
     assert row["mean_price"] == pytest.approx(50.0)
 
@@ -196,7 +208,13 @@ def test_within_hour_slope_is_compared_with_the_weather_change_across_the_hour()
     fm = eda.forecast_motivation(q, hours, eda.daily_table(q, hours, wx), wx)
     slope = fm[fm["quantity"] == "within_hour_slope"]
     assert len(slope) == len(VARIABLES)
-    assert slope["pearson_r"].tolist() == pytest.approx([1.0] * len(VARIABLES))
+    assert slope["pearson_r"].tolist() == pytest.approx([1.0] * len(VARIABLES)), (
+        "each hour's slope Q4 - Q1 is a random step, and the weather's change across each hour "
+        "is that step: next hour minus this hour for temperature and wind (values at the hour's "
+        "start), (next hour - previous hour) / 2 for radiation (a mean over the hour); a change "
+        "taken towards the previous hour, or radiation's taken to the next hour only, would not "
+        "give r = 1"
+    )
     assert (slope["n"] == 48).all()
 
 

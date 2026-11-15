@@ -10,7 +10,7 @@ Data lives outside the repo. Set `IB15_DATA_DIR` to the data folder, or pass `--
 
 ```
 uv sync
-export IB15_DATA_DIR=D:/code/iberian-battery-15min-data
+export IB15_DATA_DIR=/path/to/iberian-battery-15min-data
 uv run ib15 download omie    # optional: --start YYYY-MM-DD --end YYYY-MM-DD
 uv run ib15 build
 ```

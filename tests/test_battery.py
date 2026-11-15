@@ -57,13 +57,25 @@ def simulate(c, d, dt, energy):
     return SOC_START * energy + np.cumsum(ETA * c * dt - d * dt / ETA)
 
 
-def test_two_quarter_hours_hand_solved():
+def test_two_quarter_hours_hand_solved_fill_at_0_then_empty_back_to_the_start_at_100():
     energy = 0.1
     r = solve_day([0.0, 100.0], DT_15MIN, energy, MAIN)
     stored = energy - SOC_START * energy
-    np.testing.assert_allclose(r.charge, [stored / (ETA * DT_15MIN), 0], atol=1e-9)
-    np.testing.assert_allclose(r.discharge, [0, stored * ETA / DT_15MIN], atol=1e-9)
-    np.testing.assert_allclose(r.energy, [energy, SOC_START * energy], atol=1e-9)
+    power_never_binds = (
+        "a 0.1 MWh battery starts with 0.05 MWh; power never binds (0.25 MWh a quarter)"
+    )
+    np.testing.assert_allclose(
+        r.charge, [stored / (ETA * DT_15MIN), 0], atol=1e-9, err_msg=power_never_binds
+    )
+    np.testing.assert_allclose(
+        r.discharge, [0, stored * ETA / DT_15MIN], atol=1e-9, err_msg=power_never_binds
+    )
+    np.testing.assert_allclose(
+        r.energy,
+        [energy, SOC_START * energy],
+        atol=1e-9,
+        err_msg="full at 0, back to 0.05 MWh at 100",
+    )
     assert r.discharged_mwh == pytest.approx(stored * ETA)
     assert r.gross == pytest.approx(100 * stored * ETA)
     assert r.degradation == pytest.approx(20 * stored * ETA)
@@ -77,7 +89,13 @@ def test_flat_prices_give_no_dispatch_in_main():
     assert r.gross == pytest.approx(0, abs=TOL) and r.net == pytest.approx(0, abs=TOL)
 
 
-@pytest.mark.parametrize("sell, trades", [(76.0, False), (78.0, True)])
+@pytest.mark.parametrize(
+    "sell, trades",
+    [
+        pytest.param(76.0, False, id="buy-50-costs-56.8-sold-spread-19.2-below-cost-20"),
+        pytest.param(78.0, True, id="buy-50-costs-56.8-sold-spread-21.2-above-cost-20"),
+    ],
+)
 def test_degradation_cost_blocks_a_cycle_below_20_net_of_losses(sell, trades):
     r = solve_day([50.0, sell], DT_15MIN, 0.1, MAIN)
     assert (r.discharged_mwh > TOL) == trades
@@ -160,10 +178,15 @@ def test_charge_plus_discharge_stays_within_power_at_negative_prices(hours):
     for n, dt in ((96, DT_15MIN), (24, DT_HOURLY)):
         r = solve_day(np.full(n, -100.0), dt, energy, NO_COST)
         assert (r.charge + r.discharge).max() <= POWER_MW + 1e-9
-        unconstrained = 100 * (1 - RTE) * n * dt
-        shared = unconstrained / (1 + RTE)
-        assert r.net == pytest.approx(shared, abs=TOL)
-        assert r.net < unconstrained - 1
+        unconstrained_charge_1_discharge_rte_every_period = 100 * (1 - RTE) * n * dt
+        shared_limit_best_charges_periods_over_1_plus_rte = (
+            unconstrained_charge_1_discharge_rte_every_period / (1 + RTE)
+        )
+        assert r.net == pytest.approx(shared_limit_best_charges_periods_over_1_plus_rte, abs=TOL)
+        assert r.net < unconstrained_charge_1_discharge_rte_every_period - 1, (
+            "at -100 the battery burns energy by charging and discharging at once, keeping "
+            "sum(d) = RTE * sum(c); without the shared limit it would earn 100 * (1 - RTE) an hour"
+        )
         assert r.simultaneous > 0
 
 
@@ -343,7 +366,9 @@ def test_a_results_file_open_in_another_program_leaves_the_previous_results(tmp_
     previous = previous_results(out)
     summary = out / "perfect_foresight_summary.csv"
     with open(summary):
-        assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1
+        assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 1, (
+            "Python's open() on Windows blocks rename and delete the way Excel does"
+        )
     assert f"cannot replace {summary}" in capsys.readouterr().err
     assert files_in(out) == previous
     assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
@@ -365,8 +390,10 @@ KILLED = {
 }
 
 
-@pytest.mark.parametrize("leftovers, kept", KILLED.values(), ids=KILLED.keys())
-def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(tmp_path, leftovers, kept):
+@pytest.mark.parametrize("leftovers, later_failure_keeps", KILLED.values(), ids=KILLED.keys())
+def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(
+    tmp_path, leftovers, later_failure_keeps
+):
     a, b = tmp_path / "a", tmp_path / "b"
 
     def leave(files):
@@ -384,7 +411,13 @@ def test_files_left_by_a_killed_run_neither_block_nor_become_the_result(tmp_path
     leave(leftovers)
     with pytest.raises(OSError, match="disk full"):
         _write_all({a: write("newest a"), b: fail})
-    assert files_in(tmp_path) == {"a": f"{kept} a".encode(), "b": f"{kept} b".encode()}
+    assert files_in(tmp_path) == {
+        "a": f"{later_failure_keeps} a".encode(),
+        "b": f"{later_failure_keeps} b".encode(),
+    }, (
+        "for a and b written in that order, a later run that fails leaves the files from before "
+        "the killed run (old), unless that run had put all its new files in place (new)"
+    )
 
     leave(leftovers)
     _write_all({a: write("newest a"), b: write("newest b")})
@@ -555,7 +588,9 @@ def test_the_interval_matches_the_normal_one_for_independent_days():
     stats = uplift_statistics(daily, 1, "main", bootstrap_days(n))
     lo, hi = interval(stats["net_uplift_eur_per_mw_day"])
     half = 1.96 * u.std(ddof=1) / math.sqrt(n)
-    assert (hi - lo) / 2 == pytest.approx(half, rel=0.15)
+    assert (hi - lo) / 2 == pytest.approx(half, rel=0.15), (
+        "sd 20 over 1000 independent days: half-width about 1.96 * 20 / sqrt(1000) = 1.24"
+    )
     assert (hi + lo) / 2 == pytest.approx(u.mean(), abs=0.15 * half)
 
 
@@ -609,13 +644,18 @@ def test_portugal_rows_follow_the_portuguese_price():
 def test_price_agreement_on_a_hand_computed_case():
     es = [10.0, 20.0, 30.0, 40.0, 50.0, 50.0, 50.0, 50.0]
     pt = [10.0, 20.0, 30.0, 40.0, 46.0, 50.0, 58.0, 50.0]
-    up = [[p + 100 for p in day] for day in (es, pt)]
-    q, _ = price_tables([es, up[0]], [pt, up[1]])
+    second_day_100_higher_same_spreads = [[p + 100 for p in day] for day in (es, pt)]
+    q, _ = price_tables(
+        [es, second_day_100_higher_same_spreads[0]], [pt, second_day_100_higher_same_spreads[1]]
+    )
     a = price_agreement(q.iloc[::-1])
     assert a["quarter_hours"] == 16
     assert a["share_pt_equal_to_es"] == 12 / 16
     assert a["mean_abs_pt_minus_es_eur_per_mwh"] == pytest.approx(2 * (4 + 8) / 16)
-    assert a["mean_within_hour_spread_eur_per_mwh"] == pytest.approx({"es": 15.0, "pt": 21.0})
+    assert a["mean_within_hour_spread_eur_per_mwh"] == pytest.approx({"es": 15.0, "pt": 21.0}), (
+        "spreads each day: Spain 30 and 0, Portugal 30 and 12; pooling the two days by hour of "
+        "day would give a spread of 130 in the first hour"
+    )
 
 
 def test_portugal_intervals_are_the_bootstrap_intervals_of_each_market():
