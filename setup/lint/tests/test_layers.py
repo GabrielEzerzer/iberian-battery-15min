@@ -23,7 +23,7 @@ CASES = {
             "from ib15 import (\n    omie,\n    battery,\n)\n",
         ),
         "from ib15.omie import FILE_RE, read_day\nimport ib15.omie\nfrom ib15 import omie\n"
-        "from .omie import read_day\nfrom ib15 import (\n    omie,\n)\n",
+        "from .omie import read_day\nfrom ib15 import (\n    omie,\n)\nimport ib15.omie as o\n",
     ),
     "ib15-layer-battery-weather": (
         "src/ib15/weather.py",
@@ -84,7 +84,10 @@ CASES = {
 }
 
 ALLOWED_HOME = {
-    "ib15-layer-battery-weather": ("src/ib15/battery.py", "from ib15 import dataset\nfrom ib15 import omie\n"),
+    "ib15-layer-battery-weather": (
+        "src/ib15/battery.py",
+        "from ib15 import dataset\nfrom ib15 import omie\nimport ib15.omie, ib15.dataset\n",
+    ),
     "ib15-network-only-in-omie": ("src/ib15/omie.py", "import urllib.request\nimport urllib.error\n"),
     "ib15-settings-only-in-cli": ("src/ib15/cli.py", "import argparse\nimport os\n\nD = os.environ.get('X')\n"),
     "ib15-plots-only-in-eda": ("src/ib15/eda.py", "import matplotlib\nimport matplotlib.pyplot as plt\n"),

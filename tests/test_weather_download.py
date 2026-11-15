@@ -117,13 +117,17 @@ def test_settled_chunk_on_disk_is_skipped(tmp_path):
     for loc in TWO:
         (tmp_path / weather.file_name(loc, *OCT)).write_bytes(body(loc, *OCT))
     fake = FakeOpenMeteo()
-    r = run(tmp_path, fake, *OCT, today=date(2025, 10, 29))
+    end_is_two_days_back = date(2025, 10, 29)
+    r = run(tmp_path, fake, *OCT, today=end_is_two_days_back)
     assert fake.requested == [] and len(r.skipped) == 2 and not r.saved
 
 
 def test_settled_chunk_with_nulls_is_fetched_again_and_replaced(tmp_path):
     d = json.loads(body("madrid", *OCT))
-    d["hourly"]["temperature_2m_previous_day2"][-5:] = [None] * 5
+    saved_while_its_end_was_in_the_future_last_hours_null = [None] * 5
+    d["hourly"]["temperature_2m_previous_day2"][-5:] = (
+        saved_while_its_end_was_in_the_future_last_hours_null
+    )
     with_nulls = weather.file_name("madrid", *OCT)
     (tmp_path / with_nulls).write_text(json.dumps(d))
     complete = weather.file_name("sevilla", *OCT)
@@ -140,12 +144,18 @@ def test_rerun_keeps_a_partly_overlapping_file_and_deletes_a_covered_one(tmp_pat
     covered = weather.file_name("sevilla", date(2025, 10, 20), date(2025, 10, 25))
     (tmp_path / covered).write_bytes(body("sevilla", date(2025, 10, 20), date(2025, 10, 25)))
     r = run(tmp_path, FakeOpenMeteo(), date(2025, 10, 15), date(2025, 10, 31))
-    assert not r.errors and len(r.saved) == 2
+    assert not r.errors and len(r.saved) == 2, (
+        "Oct 1-20 overlaps Oct 15-31 without covering it, so the chunk is fetched"
+    )
     narrow = [weather.file_name(loc, date(2025, 10, 15), date(2025, 10, 31)) for loc in TWO]
-    assert names(tmp_path) == sorted([part, *narrow])
+    assert names(tmp_path) == sorted([part, *narrow]), (
+        "Oct 1-14 survive in the older madrid file; the sevilla file inside the new range is gone"
+    )
 
 
-def test_narrower_rerun_inside_a_complete_saved_month_is_skipped(tmp_path):
+def test_narrower_rerun_inside_a_complete_saved_month_is_skipped_and_loads_with_no_overlap_error(
+    tmp_path,
+):
     month = (date(2025, 10, 1), date(2025, 10, 31))
     full = [weather.file_name(loc, *month) for loc in TWO]
     run(tmp_path, FakeOpenMeteo(), *month)
@@ -176,7 +186,8 @@ def test_recent_chunk_is_fetched_again_and_replaces_the_shorter_file(tmp_path):
     current = weather.file_name("sevilla", *OCT)
     (tmp_path / current).write_bytes(b"stale")
     fake = FakeOpenMeteo()
-    r = run(tmp_path, fake, *OCT, today=date(2025, 10, 28))
+    end_is_only_one_day_back = date(2025, 10, 28)
+    r = run(tmp_path, fake, *OCT, today=end_is_only_one_day_back)
     assert len(fake.requested) == 2 and not r.skipped and not r.errors
     assert names(tmp_path) == sorted([weather.file_name("madrid", *OCT), current])
     assert (tmp_path / current).read_bytes() == body("sevilla", *OCT)

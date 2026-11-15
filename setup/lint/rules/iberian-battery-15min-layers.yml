@@ -28,7 +28,7 @@ rule:
     - kind: import_statement
       regex: '^import\s+ib15\b'
       not:
-        regex: '^import\s+ib15\.omie\s*$'
+        regex: '^import\s+ib15\.omie(\s+as\s+\w+)?(\s*,\s*ib15\.omie(\s+as\s+\w+)?)*\s*$'
 ---
 id: ib15-layer-battery-weather
 language: Python
@@ -48,7 +48,7 @@ rule:
     - kind: import_statement
       regex: '^import\s+ib15\b'
       not:
-        regex: '^import\s+ib15\.(omie|dataset)\s*$'
+        regex: '^import\s+ib15\.(omie|dataset)(\s+as\s+\w+)?(\s*,\s*ib15\.(omie|dataset)(\s+as\s+\w+)?)*\s*$'
 ---
 id: ib15-layer-eda
 language: Python

@@ -37,21 +37,23 @@ def prices(days, price_fn=None):
 
 
 def test_within_hour_spread_and_flat_share_on_dst_day():
-    day = date(2025, 10, 26)
-    q = prices([day], price_fn=lambda i: 50.0)
+    autumn_dst_day_100_periods_25_hours = date(2025, 10, 26)
+    q = prices([autumn_dst_day_100_periods_25_hours], price_fn=lambda i: 50.0)
     q.loc[q["period"].between(1, 4), "price_es"] = [10.0, 30.0, 20.0, 40.0]
     q.loc[q["period"].between(97, 100), "price_es"] = [5.0, 5.0, 5.0, 9.0]
     h = eda.hour_table(q)
-    assert len(h) == 25
+    assert len(h) == 25, "2025-10-26 is the autumn DST day: 100 periods, 25 hours"
     assert h.loc[0, "spread"] == 30.0
-    assert h.loc[0, "slope"] == 30.0
+    assert h.loc[0, "slope"] == 30.0, "40 - 10"
     assert h.loc[24, "spread"] == 4.0
     assert h.loc[24, "hour"] == 24
     s = eda.spread_summary(h)
     assert s["hours"] == 25
     assert s["share_flat_hours"] == pytest.approx(23 / 25)
     assert s["mean_spread"] == pytest.approx(34 / 25)
-    assert h.loc[0, "abs_dev"] == pytest.approx(10.0)
+    assert h.loc[0, "abs_dev"] == pytest.approx(10.0), (
+        "first hour: mean 25, |dev| = 15, 5, 5, 15 -> 10"
+    )
 
 
 def test_quarter_deviations_sum_to_zero_within_each_hour():
@@ -67,8 +69,8 @@ def test_concentration_shares_on_hand_made_vector():
     u = [50, 30] + [10] * 4 + [1] * 10 + [0] * 4
     c = eda.concentration(u)
     total = 130
-    assert c["share_from_top_10pct_days"] == pytest.approx(80 / total)
-    assert c["share_from_top_25pct_days"] == pytest.approx(110 / total)
+    assert c["share_from_top_10pct_days"] == pytest.approx(80 / total), "2 days"
+    assert c["share_from_top_25pct_days"] == pytest.approx(110 / total), "5 days"
     assert c["share_days_zero_uplift"] == pytest.approx(4 / 20)
     assert c["median_daily_uplift_eur_per_mw"] == 1.0
     assert c["mean_daily_uplift_eur_per_mw"] == pytest.approx(130 / 20)
@@ -76,8 +78,8 @@ def test_concentration_shares_on_hand_made_vector():
 
 def test_concentration_rounds_top_share_up_to_whole_days():
     c = eda.concentration([5, 4, 3, 2, 1])
-    assert c["share_from_top_10pct_days"] == pytest.approx(5 / 15)
-    assert c["share_from_top_25pct_days"] == pytest.approx(9 / 15)
+    assert c["share_from_top_10pct_days"] == pytest.approx(5 / 15), "10% of 5 days -> 1 day"
+    assert c["share_from_top_25pct_days"] == pytest.approx(9 / 15), "25% of 5 days -> 2 days"
 
 
 def test_autocorr_periodic_and_sign_flipping():
@@ -92,7 +94,7 @@ def test_autocorr_periodic_and_sign_flipping():
     r, _ = eda.autocorr(flip, pd.Timedelta(days=1))
     assert r == pytest.approx(-1.0)
     r7, n7 = eda.autocorr(flip, pd.Timedelta(days=7))
-    assert r7 == pytest.approx(-1.0)
+    assert r7 == pytest.approx(-1.0), "odd lag in days"
     assert n7 == 96 * 13
 
 
@@ -126,7 +128,9 @@ def test_one_cycle_spread_by_hand():
             "2025-11-30: hourly means 37.5 for the hours with a 0 and 62.5 for the hour with the "
             "100, so 62.5 - 37.5 = 25; 2025-10-26: 80"
         )
-        assert r["uplift_pct"] == pytest.approx(100 * (142.5 / 105 - 1))
+        assert r["uplift_pct"] == pytest.approx(100 * (142.5 / 105 - 1)), (
+            "Portugal at twice Spain's prices: spreads double, uplift unchanged"
+        )
         r = t.loc[(market, "full")]
         assert (r["start"], r["end"], r["days"]) == (days[0], days[2], 3)
         assert r["spread_15min_eur_per_mwh"] == pytest.approx(k * 152.5 / 3), (
@@ -148,12 +152,15 @@ def weather_frame(hours):
 
 def test_national_mean_averages_the_ten_locations_at_each_hour():
     hours = pd.date_range("2025-10-01", periods=5, freq="h", tz="UTC")
-    w = weather_frame(hours).sample(frac=1, random_state=0)
-    m = eda.national_mean(w)
+    shuffled_as_order_must_not_matter = weather_frame(hours).sample(frac=1, random_state=0)
+    m = eda.national_mean(shuffled_as_order_must_not_matter)
     assert list(m.index) == list(hours)
     for i, t in enumerate(hours):
         for v in VARIABLES:
-            assert m.loc[t, v] == pytest.approx(4.5 + i)
+            assert m.loc[t, v] == pytest.approx(4.5 + i), (
+                "location j has value j + hour index for every variable, so the national mean at "
+                "hour i is 4.5 + i"
+            )
 
 
 def test_national_mean_rejects_a_missing_location_hour():
@@ -186,8 +193,8 @@ def test_uplift_by_month_percent_is_a_ratio_of_sums():
         "daily uplifts of 10% and 5% average 7.5%, but over the month the 15-minute value is "
         "(110 + 315) / (100 + 300) of hourly"
     )
-    assert row["mean_within_hour_spread"] == pytest.approx(20.0)
-    assert row["mean_price"] == pytest.approx(50.0)
+    assert row["mean_within_hour_spread"] == pytest.approx(20.0), "40, 60, 50, 50: spread 20"
+    assert row["mean_price"] == pytest.approx(50.0), "40, 60, 50, 50: mean 50"
 
 
 def test_within_hour_slope_is_compared_with_the_weather_change_across_the_hour():
@@ -196,9 +203,14 @@ def test_within_hour_slope_is_compared_with_the_weather_change_across_the_hour()
     q = prices(days, price_fn=lambda i: 50.0 + (steps[i // 4] if i % 4 == 3 else 0.0))
     hours = eda.hour_table(q)
     assert hours["slope"].to_numpy() == pytest.approx(steps)
-    times = pd.date_range(hours["start_utc"].iloc[0] - pd.Timedelta(hours=1), periods=50, freq="h")
-    walk = np.concatenate([[0.0, 0.0], np.cumsum(steps)])
-    centred = np.zeros(50)
+    from_the_hour_before_the_first_price_hour_to_the_hour_after_the_last = pd.date_range(
+        hours["start_utc"].iloc[0] - pd.Timedelta(hours=1), periods=50, freq="h"
+    )
+    times = from_the_hour_before_the_first_price_hour_to_the_hour_after_the_last
+    walk_i_plus_2_minus_walk_i_plus_1_is_step_i = np.concatenate([[0.0, 0.0], np.cumsum(steps)])
+    walk = walk_i_plus_2_minus_walk_i_plus_1_is_step_i
+    centred_i_plus_2_minus_centred_i_over_2_is_step_i = np.zeros(50)
+    centred = centred_i_plus_2_minus_centred_i_over_2_is_step_i
     for i, step in enumerate(steps):
         centred[i + 2] = centred[i] + 2 * step
     wx = pd.DataFrame(
@@ -219,7 +231,10 @@ def test_within_hour_slope_is_compared_with_the_weather_change_across_the_hour()
 
 
 def write_data_dir(root, with_sensitivity):
-    days = [date(2025, 10, 20) + timedelta(days=i) for i in range(12)]
+    twelve_days_including_the_10_26_dst_day = [
+        date(2025, 10, 20) + timedelta(days=i) for i in range(12)
+    ]
+    days = twelve_days_including_the_10_26_dst_day
     q = prices(days)
     h = hourly_benchmark(q)
     ds, res = root / "dataset", root / "results"
@@ -342,13 +357,16 @@ def test_a_failure_partway_leaves_the_previous_outputs(tmp_path, monkeypatch):
     monkeypatch.setattr(Figure, "savefig", fail_at_figure_e)
     with pytest.raises(OSError, match="disk full"):
         cli.main(["eda", "--data-dir", str(tmp_path)])
-    assert files_in(out) == previous
+    assert files_in(out) == previous, (
+        "by figure E the tables and figures A to D are in their .part files; byte for byte, and "
+        "no .part or .prev left"
+    )
 
     monkeypatch.undo()
     assert cli.main(["eda", "--data-dir", str(tmp_path)]) == 0
     new = files_in(out)
     assert set(new) == set(previous)
-    assert all(new[name] != previous[name] for name in previous)
+    assert all(new[name] != previous[name] for name in previous), "the next run replaces every file"
 
 
 def test_a_run_without_the_cost_sensitivity_deletes_an_earlier_figure_g(tmp_path):

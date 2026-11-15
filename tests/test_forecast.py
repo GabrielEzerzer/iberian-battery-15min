@@ -51,7 +51,8 @@ def frame(start: date, ndays: int, seed: int = 0) -> pd.DataFrame:
 
 @pytest.fixture(scope="module")
 def long_frame():
-    return frame(date(2025, 8, 15), 240)
+    covers_both_dst_changes_with_more_than_63_days_before_each = frame(date(2025, 8, 15), 240)
+    return covers_both_dst_changes_with_more_than_63_days_before_each
 
 
 def forecast_for(pw: pd.DataFrame, day: date) -> dict[str, np.ndarray]:
@@ -85,10 +86,14 @@ def test_no_look_ahead(long_frame, day):
 
     d1 = changed.copy()
     d1.loc[d1["delivery_date"] == day - timedelta(days=1), "price_es"] += 10.0
-    assert not np.allclose(forecast_for(d1, day)["expert"], base["expert"])
+    assert not np.allclose(forecast_for(d1, day)["expert"], base["expert"]), (
+        "the information that is allowed does move the forecast"
+    )
     wx = long_frame.copy()
     wx.loc[wx["delivery_date"] == day, WX_COLS] += 3.0
-    assert not np.allclose(forecast_for(wx, day)["expert_weather"], base["expert_weather"])
+    assert not np.allclose(forecast_for(wx, day)["expert_weather"], base["expert_weather"]), (
+        "the information that is allowed does move the forecast"
+    )
 
 
 def test_window_reaches_back_exactly_63_days(long_frame):
@@ -169,7 +174,9 @@ def test_the_holiday_list():
     assert list(hol) == sorted(hol)
     for d in ("2025-01-01", "2026-01-01", "2025-05-01", "2026-05-01", "2025-10-12", "2026-10-12"):
         assert date.fromisoformat(d) in hol, d
-    assert date(2026, 4, 2) not in hol
+    assert date(2026, 4, 2) not in hol, (
+        "Holy Thursday is not held in Cataluña or the Comunitat Valenciana"
+    )
 
 
 def noise_free(with_weather: bool):
@@ -192,11 +199,13 @@ def noise_free(with_weather: bool):
     gamma = rng.uniform(-1, 1, (96, 3)) * [1, 1, 0.05]
     for j in range(7, n):
         prev = p[j - 1]
-        wd = 6 if dates[j] in forecast.HOLIDAYS else dates[j].weekday()
+        weekday_a_holiday_has_the_sunday_dummies = (
+            6 if dates[j] in forecast.HOLIDAYS else dates[j].weekday()
+        )
         x = np.column_stack(
             [np.ones(96), prev, p[j - 2], p[j - 7]]
             + [np.full(96, v) for v in (prev.min(), prev.max(), prev[-1])]
-            + [np.full(96, float(wd == k)) for k in (0, 5, 6)]
+            + [np.full(96, float(weekday_a_holiday_has_the_sunday_dummies == k)) for k in (0, 5, 6)]
         )
         p[j] = (x * beta).sum(axis=1) + ((w[j] * gamma).sum(axis=1) if with_weather else 0)
     return dates, p, w
@@ -223,12 +232,22 @@ def test_dst_days_map_to_96_slots_and_back():
         back = slots[s]
         assert back.shape == (n, 2)
         if n == 92:
-            np.testing.assert_array_equal(slots[8:12], slots[4:8])
+            np.testing.assert_array_equal(
+                slots[8:12],
+                slots[4:8],
+                err_msg="02:00-02:59 does not exist: it takes 01:00-01:59",
+            )
             np.testing.assert_array_equal(back, values)
         else:
-            np.testing.assert_allclose(slots[8:12], (values[8:12] + values[12:16]) / 2)
-            np.testing.assert_allclose(back[8:12], slots[8:12])
-            np.testing.assert_allclose(back[12:16], slots[8:12])
+            np.testing.assert_allclose(
+                slots[8:12],
+                (values[8:12] + values[12:16]) / 2,
+                err_msg="02:00-02:59 happens twice (periods 9-12 and 13-16): the slot is their "
+                "mean",
+            )
+            both_get_it_back = "both occurrences of 02:00-02:59 get the slot back"
+            np.testing.assert_allclose(back[8:12], slots[8:12], err_msg=both_get_it_back)
+            np.testing.assert_allclose(back[12:16], slots[8:12], err_msg=both_get_it_back)
             keep = np.r_[0:8, 16:100]
             np.testing.assert_array_equal(back[keep], values[keep])
 
@@ -291,11 +310,16 @@ def test_error_metrics_match_hand_computed_values():
         }
     )
     e = forecast.errors(fc).set_index("model")
-    assert e.loc["naive", "mae_15min"] == pytest.approx(1.5)
-    assert e.loc["naive", "rmse_15min"] == pytest.approx(np.sqrt(3.5))
-    assert e.loc["naive", "mae_hourly"] == pytest.approx(1.0)
-    assert e.loc["naive", "rmse_hourly"] == pytest.approx(1.0)
-    assert e.loc["naive", "mae_within_hour_deviation"] == pytest.approx(1.0)
+    naive_errors = "naive errors 2, -2, 0, 4, 1, 1, 1, 1"
+    hourly_means = "hourly means 26 and 1 against 25 and 0"
+    assert e.loc["naive", "mae_15min"] == pytest.approx(1.5), naive_errors
+    assert e.loc["naive", "rmse_15min"] == pytest.approx(np.sqrt(3.5)), naive_errors
+    assert e.loc["naive", "mae_hourly"] == pytest.approx(1.0), hourly_means
+    assert e.loc["naive", "rmse_hourly"] == pytest.approx(1.0), hourly_means
+    assert e.loc["naive", "mae_within_hour_deviation"] == pytest.approx(1.0), (
+        "within-hour deviations -14, -8, 4, 18 against -15, -5, 5, 15 in the first hour, "
+        "0 in the second"
+    )
     assert e.loc["expert", ["mae_15min", "rmse_hourly"]].tolist() == [0, 0]
     assert e.loc["expert_weather", "mae_hourly"] == pytest.approx(5.0)
     assert e.loc["expert_weather", "mae_within_hour_deviation"] == pytest.approx(0.0)
@@ -352,8 +376,9 @@ def test_the_56_day_sensitivity_row_is_the_main_model_on_the_common_days():
     assert days == sorted(pw["delivery_date"].unique())[first:]
     assert len(sens) == len(battery.DURATIONS_H) * 2 * len(forecast.SENSITIVITY_WINDOWS)
 
-    fc = forecast.forecast_periods(pw)
-    fc = fc[fc["delivery_date"] >= days[0]].reset_index(drop=True)
+    main_56_day_forecasts = forecast.forecast_periods(pw)
+    fc = main_56_day_forecasts[main_56_day_forecasts["delivery_date"] >= days[0]]
+    fc = fc.reset_index(drop=True)
     rows = []
     for day, g in fc.groupby("delivery_date", sort=True):
         plans = {m: g[m].to_numpy() for m in MODELS}
@@ -372,9 +397,15 @@ def test_the_56_day_sensitivity_row_is_the_main_model_on_the_common_days():
             mae = (fc[m] - fc["price_es"]).abs().mean()
             assert s.loc[(hours, m, 56), "mae_15min"] == pytest.approx(mae, rel=1e-12)
             for c in cols:
-                assert s.loc[(hours, m, 56), c] == pytest.approx(main.loc[(hours, m), c]), c
+                assert s.loc[(hours, m, 56), c] == pytest.approx(main.loc[(hours, m), c]), (
+                    "the main 56-day forecasts, cut to the common days and valued as the main "
+                    "run does",
+                    c,
+                )
             for win in (28, 112):
-                assert s.loc[(hours, m, win), "mae_15min"] != pytest.approx(mae)
+                assert s.loc[(hours, m, win), "mae_15min"] != pytest.approx(mae), (
+                    "the other windows are really other fits"
+                )
 
 
 START = date(2025, 8, 6)
@@ -445,9 +476,12 @@ def test_run_writes_every_output(tmp_path):
     for hours in battery.DURATIONS_H:
         row = s[(s["duration_h"] == hours) & (s["model"] == "expert")].iloc[0]
         u = up[(hours, "expert")]
-        assert row["net_uplift_keur_per_mw"] == pytest.approx(u / 1000)
-        assert row["net_uplift_eur_per_mw_day"] == pytest.approx(u / days)
-        assert row["net_uplift_capture_pct"] == pytest.approx(100 * u / up[(hours, "perfect")])
+        recomputed = "the uplift columns, recomputed from the daily values"
+        assert row["net_uplift_keur_per_mw"] == pytest.approx(u / 1000), recomputed
+        assert row["net_uplift_eur_per_mw_day"] == pytest.approx(u / days), recomputed
+        assert row["net_uplift_capture_pct"] == pytest.approx(100 * u / up[(hours, "perfect")]), (
+            recomputed
+        )
     unc = pd.read_csv(out / "forecast_uncertainty.csv")
     assert (unc["days"] == days).all()
     assert len(unc) == len(battery.DURATIONS_H) * (4 * 4 + 2)
@@ -459,7 +493,11 @@ def test_run_writes_every_output(tmp_path):
             want = si.loc[(hours, a), stat] - si.loc[(hours, b), stat]
         else:
             want = si.loc[(hours, r["model"]), stat]
-        assert r["estimate"] == want, tuple(r)
+        assert r["estimate"] == want, (
+            "the uncertainty estimates are the summary values, and the differences their "
+            "differences",
+            tuple(r),
+        )
     assert meta["uncertainty"]["seed"] == battery.BOOT_SEED
     assert "tau-b" in meta["kendall_tau"]
     err = pd.read_csv(out / "forecast_errors.csv")
@@ -495,7 +533,9 @@ def test_a_missing_price_column_in_the_weather_file_stops_the_run(tmp_path, caps
 def test_too_few_days_for_one_evaluation_day_stops_the_run(tmp_path, capsys):
     write_data_dir(tmp_path, ndays=forecast.first_eval(max(forecast.SENSITIVITY_WINDOWS)))
     assert cli.main(["forecast", "--data-dir", str(tmp_path)]) == 1
-    assert "at least 120" in capsys.readouterr().err
+    assert "at least 120" in capsys.readouterr().err, (
+        "the longest sensitivity window (112 days, with lags back 7) needs 120 days"
+    )
     assert not (tmp_path / "results").exists()
 
 
@@ -533,7 +573,10 @@ def test_a_failure_while_writing_leaves_the_previous_outputs(tmp_path, monkeypat
     monkeypatch.setattr(pd.DataFrame, "to_csv", fail_at_summary)
     with pytest.raises(OSError, match="disk full"):
         cli.main(["forecast", "--data-dir", str(tmp_path)])
-    assert files_in(out) == previous
+    assert files_in(out) == previous, (
+        "by the summary the forecasts, errors, DM tests and daily values are in their .part "
+        "files; byte for byte, and no .part or .prev left"
+    )
 
     monkeypatch.undo()
     assert cli.main(["forecast", "--data-dir", str(tmp_path)]) == 0
@@ -621,7 +664,9 @@ def test_every_model_is_resampled_on_the_same_days():
         "both are resampled on the same days"
     )
     own = unc.loc[(2, "naive", "net_uplift_eur_per_mw_day")]
-    assert own["ci_high"] - own["ci_low"] > 2
+    assert own["ci_high"] - own["ci_low"] > 2, (
+        "each model's own uplift varies a lot from day to day"
+    )
     for stat in ("net_capture_15min_pct", "net_capture_hourly_pct", "net_uplift_capture_pct"):
         row = unc.loc[(2, "naive", stat)]
         assert row[["estimate", "ci_low", "ci_high"]].tolist() == pytest.approx([50, 50, 50]), (
@@ -655,7 +700,13 @@ def test_kendall_tau_matches_hand_computed_values():
 def test_regret_drivers_match_hand_computed_values():
     days = [date(2026, 1, 1) + timedelta(days=i) for i in range(4)]
     actual = np.array([0.0, 10.0, 20.0, 30.0])
-    forecasts = [actual + 1, [10.0, 0.0, 20.0, 30.0], actual + 2, actual[::-1]]
+    daily_mae_1_5_2_20_and_tau_1_4_6_1_minus_1_for_every_model = [
+        actual + 1,
+        [10.0, 0.0, 20.0, 30.0],
+        actual + 2,
+        actual[::-1],
+    ]
+    forecasts = daily_mae_1_5_2_20_and_tau_1_4_6_1_minus_1_for_every_model
     fc = pd.DataFrame(
         {
             "delivery_date": np.repeat(days, 4),
@@ -666,10 +717,14 @@ def test_regret_drivers_match_hand_computed_values():
     for m in MODELS:
         fc[m] = np.concatenate(forecasts)
     perfect = np.full(4, 100.0)
-    regret = np.array([3.0, 1.0, 2.0, 4.0])
+    naive_regret = np.array([3.0, 1.0, 2.0, 4.0])
+    expert_10_higher_expert_weather_20_higher = 10
     daily = value_daily(
         {"perfect": (perfect, perfect)}
-        | {m: (perfect - regret - 10 * k, perfect) for k, m in enumerate(MODELS)}
+        | {
+            m: (perfect - naive_regret - expert_10_higher_expert_weather_20_higher * k, perfect)
+            for k, m in enumerate(MODELS)
+        }
     )
     d = forecast.regret_drivers(fc, daily).set_index(["duration_h", "model"])
     for hours in battery.DURATIONS_H:

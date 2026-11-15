@@ -42,7 +42,7 @@ def test_utc_starts_unique_and_15min_apart_across_dst_days(data_dir, names, dst_
     ts = q["delivery_start_utc"]
     assert str(ts.dt.tz) == "UTC"
     assert ts.is_unique
-    assert (ts.diff().dropna() == pd.Timedelta(minutes=15)).all()
+    assert (ts.diff().dropna() == pd.Timedelta(minutes=15)).all(), "across both midnights"
     day = q[q["delivery_date"] == dst_day]
     assert day["period"].tolist() == list(range(1, n + 1))
     assert day["delivery_start_utc"].iloc[0] == first_utc

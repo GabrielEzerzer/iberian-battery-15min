@@ -24,10 +24,12 @@ def raw_json(loc, rng):
 def synthetic(loc, rng):
     d = raw_json("madrid", rng)
     d["latitude"], d["longitude"] = weather.LOCATIONS[loc]
-    k = list(weather.LOCATIONS).index(loc)
+    shift_by_location_index_so_locations_differ = list(weather.LOCATIONS).index(loc)
     for key, vals in d["hourly"].items():
         if key != "time":
-            d["hourly"][key] = [None if v is None else v + k for v in vals]
+            d["hourly"][key] = [
+                None if v is None else v + shift_by_location_index_so_locations_differ for v in vals
+            ]
     return json.dumps(d).encode()
 
 
@@ -148,13 +150,16 @@ def test_radiation_is_the_mean_of_the_hour_starting_at_valid_time(two_locations)
     assert row["temperature_2m"] == raw_value("madrid", OCT, "temperature_2m", t)
     assert row["wind_speed_100m"] == raw_value("madrid", OCT, "wind_speed_100m", t)
     nxt = t + timedelta(hours=1)
-    assert row["shortwave_radiation"] == raw_value("madrid", OCT, "shortwave_radiation", nxt)
+    assert row["shortwave_radiation"] == raw_value("madrid", OCT, "shortwave_radiation", nxt), (
+        "Open-Meteo labels the mean over 11:00-12:00 as 12:00"
+    )
 
 
 def test_radiation_of_a_files_last_hour_comes_from_the_next_file(tmp_path, monkeypatch):
     monkeypatch.setattr(weather, "LOCATIONS", {"madrid": TWO["madrid"]})
     d = raw_json("madrid", OCT)
-    d["hourly"]["shortwave_radiation_previous_day2"][48] = 7.0
+    first_label_of_the_second_file = 48
+    d["hourly"]["shortwave_radiation_previous_day2"][first_label_of_the_second_file] = 7.0
     for (start, end), sl in [
         ((OCT[0], date(2025, 10, 26)), slice(0, 48)),
         ((OCT[1],) * 2, slice(48, None)),
@@ -162,7 +167,9 @@ def test_radiation_of_a_files_last_hour_comes_from_the_next_file(tmp_path, monke
         part = {**d, "hourly": {k: v[sl] for k, v in d["hourly"].items()}}
         (tmp_path / weather.file_name("madrid", start, end)).write_text(json.dumps(part))
     h = weather.load_hourly(tmp_path).set_index("valid_time_utc")
-    assert h.loc[pd.Timestamp("2025-10-26 23:00", tz=UTC), "shortwave_radiation"] == 7.0
+    assert h.loc[pd.Timestamp("2025-10-26 23:00", tz=UTC), "shortwave_radiation"] == 7.0, (
+        "the real October fixture split into two files at 2025-10-27 00:00, as at a month boundary"
+    )
 
 
 @pytest.mark.parametrize("names, rng", [(OCT_PRICES, OCT), (MAR_PRICES, MAR)], ids=["oct", "mar"])
@@ -188,7 +195,9 @@ def test_join_gives_each_quarter_hour_its_utc_hour(two_locations, names, rng):
             assert row[f"temp_{loc}"] == want["temperature_2m"]
             assert row[f"wind100_{loc}"] == want["wind_speed_100m"]
             assert row[f"ghi_{loc}"] == want["shortwave_radiation"]
-    assert (j["temp_madrid"] != j["temp_sevilla"]).any()
+    assert (j["temp_madrid"] != j["temp_sevilla"]).any(), (
+        "the two locations really differ, so a swapped column would show"
+    )
 
 
 def test_join_on_the_repeated_local_hour_of_2025_10_26(two_locations):
@@ -197,11 +206,18 @@ def test_join_on_the_repeated_local_hour_of_2025_10_26(two_locations):
     j = weather.join(p, h[h["valid_time_utc"].isin(hours_of(p))])
     day = j[j["delivery_date"] == date(2025, 10, 26)]
     assert len(day) == 100
+    local_2_to_3_occurs_twice = (
+        "local 02:00-03:00 occurs twice: periods 9-12 (CEST, 00:00 UTC), 13-16 (CET, 01:00 UTC)"
+    )
     for periods, hour in [((9, 12), 0), ((13, 16), 1)]:
         rows = day[day["period"].between(*periods)]
         t = datetime(2025, 10, 26, hour, tzinfo=UTC)
-        assert (rows["temp_madrid"] == raw_value("madrid", OCT, "temperature_2m", t)).all()
-        assert (rows["temp_sevilla"] == raw_value("sevilla", OCT, "temperature_2m", t)).all()
+        assert (rows["temp_madrid"] == raw_value("madrid", OCT, "temperature_2m", t)).all(), (
+            local_2_to_3_occurs_twice
+        )
+        assert (rows["temp_sevilla"] == raw_value("sevilla", OCT, "temperature_2m", t)).all(), (
+            local_2_to_3_occurs_twice
+        )
 
 
 def test_join_on_the_short_day_2026_03_29(two_locations):
@@ -212,7 +228,9 @@ def test_join_on_the_short_day_2026_03_29(two_locations):
     assert len(day) == 92
     row = day[day["period"] == 9].iloc[0]
     t = datetime(2026, 3, 29, 1, tzinfo=UTC)
-    assert row["delivery_start_utc"] == t
+    assert row["delivery_start_utc"] == t, (
+        "period 9 is 03:00 CEST = 01:00 UTC, right after the skipped local hour"
+    )
     assert row["wind100_sevilla"] == raw_value("sevilla", MAR, "wind_speed_100m", t)
 
 
@@ -223,7 +241,7 @@ def good():
         [(t, loc, 10.0, 5.0, 100.0, weather.MODEL) for t in hours for loc in weather.LOCATIONS],
         columns=["valid_time_utc", "location", *weather.VARIABLES, "model"],
     )
-    weather.validate(frame, hours)
+    assert weather.validate(frame, hours) is None, "the unbroken frame passes"
     return frame, hours
 
 
@@ -269,11 +287,15 @@ def utc(*a):
 
 
 def test_latest_run_matches_the_previous_day2_construction():
-    assert weather.latest_run(utc(2026, 11, 4, 0)) == utc(2026, 11, 2, 0)
-    assert weather.latest_run(utc(2026, 11, 4, 3)) == utc(2026, 11, 2, 0)
-    assert weather.latest_run(utc(2026, 11, 4, 6)) == utc(2026, 11, 2, 6)
-    assert weather.latest_run(utc(2026, 11, 4, 22)) == utc(2026, 11, 3, 0)
-    assert weather.latest_run(utc(2026, 11, 4, 23)) == utc(2026, 11, 3, 0)
+    on_the_grid = "on the 3-hourly grid the value is the latest run at least 48 h old"
+    assert weather.latest_run(utc(2026, 11, 4, 0)) == utc(2026, 11, 2, 0), on_the_grid
+    assert weather.latest_run(utc(2026, 11, 4, 3)) == utc(2026, 11, 2, 0), on_the_grid
+    assert weather.latest_run(utc(2026, 11, 4, 6)) == utc(2026, 11, 2, 6), on_the_grid
+    between_grid_points = (
+        "between grid points it is interpolated using points up to 6 h after the grid point below"
+    )
+    assert weather.latest_run(utc(2026, 11, 4, 22)) == utc(2026, 11, 3, 0), between_grid_points
+    assert weather.latest_run(utc(2026, 11, 4, 23)) == utc(2026, 11, 3, 0), between_grid_points
 
 
 @pytest.mark.parametrize(
@@ -298,7 +320,8 @@ def test_latest_run_matches_the_previous_day2_construction():
 )
 def test_bid_time_rule_for_the_last_hour_of_the_day(day, last_hour, deadline):
     assert weather.bid_deadline(day) == deadline
-    label = last_hour + timedelta(hours=1)
+    radiation_of_the_last_hour_is_labelled_one_later = last_hour + timedelta(hours=1)
+    label = radiation_of_the_last_hour_is_labelled_one_later
     assert weather.latest_run(label) == datetime.combine(
         day - timedelta(days=1), datetime.min.time(), UTC
     )
@@ -308,12 +331,14 @@ def test_bid_time_rule_for_the_last_hour_of_the_day(day, last_hour, deadline):
 
 
 def test_previous_day1_fails_the_rule_in_the_afternoon():
-    assert not weather.issued_before_bid(utc(2026, 7, 15, 13), date(2026, 7, 15), lead_days=1)
+    assert not weather.issued_before_bid(utc(2026, 7, 15, 13), date(2026, 7, 15), lead_days=1), (
+        "14:00 CEST on delivery day; a one-day lead comes from a run after the deadline"
+    )
 
 
 def test_build_check_fails_when_a_run_is_published_too_late(monkeypatch):
     p = prices(OCT_PRICES)
-    assert weather.check_bid_time(p) == pytest.approx(2.0)
+    assert weather.check_bid_time(p) == pytest.approx(2.0), "D-1 00 UTC run, 08:00 vs 10:00"
     monkeypatch.setattr(weather, "PUBLISHED_AFTER", timedelta(hours=10, minutes=1))
     with pytest.raises(BuildError, match="published after the bid deadline"):
         weather.check_bid_time(p)
@@ -368,14 +393,14 @@ def test_build_writes_weather_files(full):
     h = pd.read_parquet(out / "weather_hourly.parquet")
     j = pd.read_parquet(out / "prices_weather_15min.parquet")
     n_hours = len(hours_of(p))
-    assert n_hours == 49
+    assert n_hours == 49, "25 + 24 UTC hours"
     assert list(h.columns) == ["valid_time_utc", "location", *weather.VARIABLES, "model"]
     assert str(h["valid_time_utc"].dt.tz) == "UTC"
     assert len(h) == n_hours * 10 and set(h["model"]) == {weather.MODEL}
     assert len(j) == len(p) == 196
     pd.testing.assert_frame_equal(j[p.columns], p)
     assert len(j.columns) == len(p.columns) + 30
-    assert (j["temp_zaragoza"] - j["temp_madrid"]).round(6).eq(4).all()
+    assert (j["temp_zaragoza"] - j["temp_madrid"]).round(6).eq(4).all(), "each in its columns"
     on_disk = json.loads((out / "weather_coverage.json").read_text())
     assert on_disk == json.loads(json.dumps(cov))
     assert cov["model"] == "ecmwf_ifs025" and cov["lead"] == "previous_day2"
@@ -393,7 +418,8 @@ def test_build_writes_weather_files(full):
 def test_build_fails_on_null_and_writes_nothing(full, capsys):
     name = weather.file_name("lugo", *OCT)
     d = json.loads((full / "raw" / "openmeteo" / name).read_bytes())
-    d["hourly"]["wind_speed_100m_previous_day2"][30] = None
+    hour_2025_10_26t06_00 = 30
+    d["hourly"]["wind_speed_100m_previous_day2"][hour_2025_10_26t06_00] = None
     (full / "raw" / "openmeteo" / name).write_text(json.dumps(d))
     assert main(["build", "weather", "--data-dir", str(full)]) == 1
     err = capsys.readouterr().err
@@ -413,7 +439,9 @@ def test_build_fails_on_overlapping_files(full):
     (raw / narrow).write_text(json.dumps(d))
     with pytest.raises(BuildError, match="badajoz: duplicate hours") as e:
         weather.build(full)
-    assert f"{src.name} and {narrow} overlap in 48 hour(s)" in str(e.value)
+    assert f"{src.name} and {narrow} overlap in 48 hour(s)" in str(e.value), (
+        "the message names both files so the user knows which one to delete"
+    )
     assert "delete one of the two files" in str(e.value)
 
 
