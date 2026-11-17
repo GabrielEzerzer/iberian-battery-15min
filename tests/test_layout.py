@@ -9,6 +9,7 @@ TOP_LEVEL_FILES = (
     ".lint-baseline.json",
     ".python-version",
     "CITATION.cff",
+    "CLAUDE.md",
     "LICENSE",
     "README.md",
     "features.json",

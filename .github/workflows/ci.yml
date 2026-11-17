@@ -1,8 +1,7 @@
 # CI for this repo.
 # It runs on pushes to branches other than the default and on manual dispatch, so each push starts one run
 # and a branch has results before its PR exists.
-# Tests run offline (the HTTP layer is stubbed). Never give this workflow production URLs, real secrets,
-# .env.local or a service_role key.
+# Tests run offline (the HTTP layer is stubbed), so the workflow needs no secrets.
 name: ci
 
 on:
