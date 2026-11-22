@@ -8,9 +8,11 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.figure import Figure
 
 from ib15.battery import DURATIONS_H, WINDOWS, _write_all
 from ib15.dataset import BuildError, _git, hourly_benchmark
@@ -570,6 +572,42 @@ def fig_price_weather(q: pd.DataFrame, wx: pd.DataFrame) -> plt.Figure:
     fig.colorbar(bins[0], ax=axes, label="quarter-hours (log scale)")
     axes[0].set_ylabel("15-minute price (EUR/MWh)")
     fig.suptitle("Price against the forecast weather of its hour (descriptive)")
+    return fig
+
+
+def fig_example_day(t: pd.DataFrame, day, forecast_label: str, battery_label: str) -> Figure:
+    starts = t["delivery_start_utc"].dt.tz_convert(MADRID)
+    edges = mdates.date2num(
+        pd.concat([starts, starts.tail(1) + pd.Timedelta(minutes=15)]).dt.to_pydatetime()
+    )
+    _style()
+    fig = Figure(figsize=(FIGURE_WIDTH_INCHES, 4.6))
+    a, b = fig.subplots(2, 1, sharex=True, height_ratios=(3, 2))
+    under = {"color": AXIS, "linewidth": 2.6, "baseline": None}
+    a.stairs(t["price_hourly"].to_numpy()[::4], edges[::4], label="actual, hourly mean", **under)
+    a.stairs(t["price_15min"], edges, color=SERIES[0], baseline=None, label="actual, 15-minute")
+    a.stairs(
+        t["forecast_15min"],
+        edges,
+        color=SERIES[1],
+        linewidth=1.0,
+        baseline=None,
+        label=forecast_label,
+    )
+    a.set_ylabel("price (EUR/MWh)")
+    a.set_title(f"Example day {day.day} {day:%B %Y}: prices and the forecast")
+    a.legend(ncol=3, fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.06))
+    b.axhline(0, color=INK_2, linewidth=0.6)
+    b.stairs(t["net_mw_hourly"].to_numpy()[::4], edges[::4], label="hourly schedule", **under)
+    b.stairs(t["net_mw_15min"], edges, color=SERIES[0], baseline=None, label="15-minute schedule")
+    b.set_ylabel("discharge − charge (MW)")
+    b.set_title(battery_label)
+    b.legend(ncol=2, fontsize=7, loc="upper left")
+    b.set_xlim(edges[0], edges[-1])
+    b.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, 3), tz=MADRID))
+    b.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=MADRID))
+    b.set_xlabel("local time (Madrid)")
+    fig.tight_layout()
     return fig
 
 

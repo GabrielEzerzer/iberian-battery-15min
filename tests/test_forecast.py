@@ -23,6 +23,8 @@ OUTPUTS = {
     "forecast_uncertainty.csv",
     "forecast_regret_drivers.csv",
     "forecast_meta.json",
+    "fig_example_day.png",
+    "fig_example_day.pdf",
 }
 
 
@@ -278,6 +280,30 @@ def test_the_radiation_change_is_tilted_by_the_quarters_position_in_the_hour(lon
     np.testing.assert_allclose(tilt, np.repeat(change, 4) * np.tile([-1.5, -0.5, 0.5, 1.5], 24))
 
 
+def test_the_example_day_has_the_median_perfect_foresight_1_h_uplift():
+    uplifts = {date(2026, 1, d): u for d, u in ((1, 9.0), (2, 1.0), (3, 5.0), (4, 3.0), (5, 7.0))}
+    rows = [
+        {
+            "delivery_date": day,
+            "duration_h": hours,
+            "model": model,
+            "resolution": res,
+            "net_eur_per_mw": 100.0 + (u if res == "15min" else 0.0) * (model == "perfect"),
+        }
+        for day, u in uplifts.items()
+        for hours in battery.DURATIONS_H
+        for model in ("perfect", *MODELS)
+        for res in ("15min", "hourly")
+    ]
+    assert forecast.example_day(pd.DataFrame(rows)) == date(2026, 1, 3), (
+        "uplifts 9, 1, 5, 3, 7: the median is 5, on 3 January"
+    )
+    even = pd.DataFrame([r for r in rows if r["delivery_date"] != date(2026, 1, 5)])
+    assert forecast.example_day(even) == date(2026, 1, 4), (
+        "uplifts 9, 1, 5, 3: the lower middle day is the one at 3"
+    )
+
+
 def test_dst_days_map_to_96_slots_and_back():
     pw = frame(date(2025, 10, 25), 3)
     pw = pd.concat([pw, frame(date(2026, 3, 28), 3)], ignore_index=True)
@@ -508,6 +534,8 @@ def test_run_writes_every_output(tmp_path):
     )
     fc = pd.read_parquet(out / "forecasts_15min.parquet")
     assert fc["delivery_date"].nunique() == days and set(MODELS) <= set(fc.columns)
+    daily = pd.read_parquet(out / "forecast_value_daily.parquet")
+    assert meta["example_day"]["date"] == str(forecast.example_day(daily))
     pw = pd.read_parquet(tmp_path / "dataset" / "prices_weather_15min.parquet")
     for day, lag in ((date(2025, 12, 5), 1), (date(2025, 12, 6), 6), (date(2025, 12, 7), 7)):
         got = fc.loc[fc["delivery_date"] == day, "naive"].to_numpy()

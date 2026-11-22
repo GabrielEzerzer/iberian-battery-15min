@@ -12,7 +12,7 @@ from scipy.stats import kendalltau, norm, spearmanr
 
 from ib15 import battery
 from ib15.dataset import BuildError, _git
-from ib15.eda import quarter_deviation
+from ib15.eda import DPI, fig_example_day, quarter_deviation
 from ib15.omie import MADRID
 from ib15.weather import LOCATIONS, VARIABLES
 
@@ -87,6 +87,8 @@ SPEC = next(s for s in battery.SPECS if s.name == "main")
 BOUND_TOL_EUR_PER_MW = 1e-6
 PRICE_COLUMNS = ["delivery_start_utc", "delivery_date", "period", "price_es"]
 UPLIFT_DIFFS = (("expert", "naive"), ("expert_weather", "expert"))
+EXAMPLE_DURATION_H = 1
+EXAMPLE_MODEL = "expert_weather"
 
 
 def local_slots(starts_utc: pd.Series) -> np.ndarray:
@@ -510,6 +512,33 @@ def window_sensitivity(pw: pd.DataFrame, hourly: dict) -> tuple[pd.DataFrame, li
     return pd.DataFrame(out), sorted(base["delivery_date"].unique())
 
 
+def example_day(daily: pd.DataFrame) -> date:
+    perfect = daily[(daily["model"] == "perfect") & (daily["duration_h"] == EXAMPLE_DURATION_H)]
+    w = perfect.pivot(index="delivery_date", columns="resolution", values="net_eur_per_mw")
+    uplift = (w["15min"] - w["hourly"]).rename("uplift").reset_index()
+    ranked = uplift.sort_values(["uplift", "delivery_date"]).reset_index(drop=True)
+    return ranked.loc[(len(ranked) - 1) // 2, "delivery_date"]
+
+
+def example_day_table(day: date, fc: pd.DataFrame) -> pd.DataFrame:
+    g = fc[fc["delivery_date"] == day].sort_values("period")
+    actual = g["price_es"].to_numpy()
+    hourly = actual.reshape(-1, 4).mean(axis=1)
+    energy = battery.POWER_MW * EXAMPLE_DURATION_H
+    fine = battery.solve_day(actual, battery.DT_15MIN, energy, SPEC)
+    coarse = battery.solve_day(hourly, battery.DT_HOURLY, energy, SPEC)
+    return pd.DataFrame(
+        {
+            "delivery_start_utc": g["delivery_start_utc"].to_numpy(),
+            "price_15min": actual,
+            "price_hourly": np.repeat(hourly, 4),
+            "forecast_15min": g[EXAMPLE_MODEL].to_numpy(),
+            "net_mw_15min": fine.discharge - fine.charge,
+            "net_mw_hourly": np.repeat(coarse.discharge - coarse.charge, 4),
+        }
+    )
+
+
 def load_inputs(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     ds = data_dir / "dataset"
     paths = {
@@ -587,6 +616,13 @@ def run(data_dir: Path) -> dict:
     unc = uncertainty(daily, summary)
     drivers = regret_drivers(fc, daily)
     sensitivity, sens_dates = window_sensitivity(pw, hourly)
+    chosen = example_day(daily)
+    figure = fig_example_day(
+        example_day_table(chosen, fc),
+        chosen,
+        f"{EXAMPLE_MODEL} forecast, 15-minute",
+        f"{EXAMPLE_DURATION_H} h battery, perfect foresight, {SPEC.name} specification",
+    )
 
     eval_dates = sorted(fc["delivery_date"].unique())
     status = _git("status", "--porcelain")
@@ -661,6 +697,15 @@ def run(data_dir: Path) -> dict:
             "first_day_rule": f"day {first_eval(max(SENSITIVITY_WINDOWS)) + 1} of the dataset,"
             " the first the longest window can forecast; perfect foresight on the same days",
         },
+        "example_day": {
+            "date": str(chosen),
+            "rule": f"the evaluation day with the median perfect-foresight {EXAMPLE_DURATION_H} h"
+            f" net uplift ({SPEC.name} specification, 15-minute minus hourly net value); ties are"
+            " ordered by date and, for an even count, the lower of the two middle days is taken",
+            "figure": f"top: actual 15-minute prices, their hourly means and the {EXAMPLE_MODEL}"
+            " forecast; bottom: the perfect-foresight net power (discharge minus charge) of the"
+            " 15-minute and the hourly schedule; x-axis in local Madrid time",
+        },
         "battery": {
             "spec": SPEC.name,
             "cost_eur_per_mwh_discharged": SPEC.cost_per_mwh,
@@ -678,8 +723,13 @@ def run(data_dir: Path) -> dict:
     }
     out = data_dir / "results" / "forecast"
     out.mkdir(parents=True, exist_ok=True)
+    figures = {
+        out / f"fig_example_day.{ext}": lambda t, e=ext: figure.savefig(t, format=e, dpi=DPI)
+        for ext in ("png", "pdf")
+    }
     battery._write_all(
-        {
+        figures
+        | {
             out / "forecasts_15min.parquet": lambda t: fc.to_parquet(t, index=False),
             out / "forecast_errors.csv": lambda t: err.to_csv(t, index=False),
             out / "forecast_dm_tests.csv": lambda t: dm.to_csv(t, index=False),

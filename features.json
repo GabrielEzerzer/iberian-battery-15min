@@ -80,7 +80,9 @@
       "results/forecast/forecast_uncertainty.csv",
       "results/forecast/forecast_regret_drivers.csv",
       "results/forecast/forecast_window_sensitivity.csv",
-      "results/forecast/forecast_meta.json"
+      "results/forecast/forecast_meta.json",
+      "results/forecast/fig_example_day.png",
+      "results/forecast/fig_example_day.pdf"
     ],
     "test": "tests/test_forecast.py"
   }
