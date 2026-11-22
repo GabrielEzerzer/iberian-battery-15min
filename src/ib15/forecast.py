@@ -17,6 +17,8 @@ from ib15.omie import MADRID
 from ib15.weather import LOCATIONS, VARIABLES
 
 SLOTS = 96
+HOURS = SLOTS // 4
+QUARTER_POSITION = np.array([-1.5, -0.5, 0.5, 1.5])
 WINDOW_DAYS = 56
 LAGS = (1, 2, 7)
 
@@ -67,8 +69,18 @@ EXPERT_FEATURES = (
     "Monday",
     "Saturday",
     "Sunday",
+    "second quarter of the hour",
+    "third quarter of the hour",
+    "fourth quarter of the hour",
 )
-WEATHER_FEATURES = tuple(f"national mean {v}, same slot on D" for v in VARIABLES)
+RADIATION = "shortwave_radiation"
+HOUR_WEATHER = tuple(v for v in VARIABLES if v != RADIATION)
+WEATHER_FEATURES = tuple(f"national mean {v}, same hour on D" for v in HOUR_WEATHER)
+SHARED_WEATHER_FEATURES = (
+    f"national mean {RADIATION}, same hour on D",
+    f"change in national mean {RADIATION} across the same hour on D, times the quarter's"
+    " position in the hour (-1.5, -0.5, 0.5, 1.5)",
+)
 DM_LAG = 7
 DM_LAGS = (DM_LAG, 14, 28)
 SPEC = next(s for s in battery.SPECS if s.name == "main")
@@ -97,25 +109,33 @@ def to_slots(values: np.ndarray, slots: np.ndarray) -> np.ndarray:
     return out
 
 
-def national_weather(df: pd.DataFrame) -> np.ndarray:
+def national_weather(df: pd.DataFrame, variables) -> np.ndarray:
     return np.column_stack(
         [
-            df[[f"{prefix}_{loc}" for loc in LOCATIONS]].mean(axis=1).to_numpy()
-            for prefix, _ in VARIABLES.values()
+            df[[f"{VARIABLES[v].column_prefix}_{loc}" for loc in LOCATIONS]].mean(axis=1).to_numpy()
+            for v in variables
         ]
     )
 
 
+def radiation_ramp(radiation: np.ndarray) -> np.ndarray:
+    hourly = np.asarray(radiation, dtype=float).reshape(-1, 4).mean(axis=1)
+    return np.repeat(np.gradient(hourly), 4)
+
+
 def slot_arrays(pw: pd.DataFrame):
-    wx = national_weather(pw)
-    dates, prices, weather, slots = [], [], [], []
+    hour_wx = national_weather(pw, HOUR_WEATHER)
+    rad = national_weather(pw, (RADIATION,))[:, 0]
+    dates, prices, weather, shared, slots = [], [], [], [], []
     for day, idx in pw.groupby("delivery_date", sort=True).indices.items():
         s = local_slots(pw["delivery_start_utc"].iloc[idx])
+        ramp = radiation_ramp(rad[idx]) * QUARTER_POSITION[s % 4]
         dates.append(day)
         prices.append(to_slots(pw["price_es"].to_numpy()[idx], s))
-        weather.append(to_slots(wx[idx], s))
+        weather.append(to_slots(hour_wx[idx], s))
+        shared.append(to_slots(np.column_stack([rad[idx], ramp]), s))
         slots.append(s)
-    return dates, np.array(prices), np.array(weather), slots
+    return dates, np.array(prices), np.array(weather), np.array(shared), slots
 
 
 def day_type(d: date) -> int:
@@ -140,6 +160,7 @@ def features(dates: list[date], p: np.ndarray, w: np.ndarray | None = None) -> n
             np.full(SLOTS, float(wd == 0)),
             np.full(SLOTS, float(wd == 5)),
             np.full(SLOTS, float(wd == 6)),
+            *(np.tile(np.arange(4) == k, HOURS).astype(float) for k in (1, 2, 3)),
         ]
         if w is not None:
             cols += list(w[j].T)
@@ -147,13 +168,40 @@ def features(dates: list[date], p: np.ndarray, w: np.ndarray | None = None) -> n
     return f
 
 
-def ols_forecast(f: np.ndarray, p: np.ndarray, t: int, window: int = WINDOW_DAYS) -> np.ndarray:
+def _rows(a: np.ndarray, days: slice, hour: int) -> np.ndarray:
+    return a[days, 4 * hour : 4 * hour + 4].reshape(-1, *a.shape[2:])
+
+
+def _residual(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    return y - x @ np.linalg.lstsq(x, y, rcond=None)[0]
+
+
+def ols_forecast(
+    f: np.ndarray,
+    p: np.ndarray,
+    t: int,
+    window: int = WINDOW_DAYS,
+    shared: np.ndarray | None = None,
+) -> np.ndarray:
     if t < first_eval(window):
         raise ValueError(f"day {t} has no full window; the first is {first_eval(window)}")
+    past = slice(t - window, t)
+    offset = np.zeros(p.shape)
+    if shared is not None:
+        r = np.vstack(
+            [
+                _residual(
+                    _rows(f, past, h), np.column_stack([_rows(shared, past, h), _rows(p, past, h)])
+                )
+                for h in range(HOURS)
+            ]
+        )
+        offset = shared @ np.linalg.lstsq(r[:, :-1], r[:, -1], rcond=None)[0]
     out = np.empty(SLOTS)
-    for s in range(SLOTS):
-        beta = np.linalg.lstsq(f[t - window : t, s], p[t - window : t, s], rcond=None)[0]
-        out[s] = f[t, s] @ beta
+    for h in range(HOURS):
+        beta = np.linalg.lstsq(_rows(f, past, h), _rows(p - offset, past, h), rcond=None)[0]
+        today = slice(4 * h, 4 * h + 4)
+        out[today] = f[t, today] @ beta + offset[t, today]
     return out
 
 
@@ -165,23 +213,30 @@ def naive_forecast(dates: list[date], p: np.ndarray, t: int) -> np.ndarray:
 
 
 def forecast_slots(
-    dates: list[date], p: np.ndarray, w: np.ndarray, targets, window: int = WINDOW_DAYS
+    dates: list[date],
+    p: np.ndarray,
+    w: np.ndarray,
+    shared: np.ndarray,
+    targets,
+    window: int = WINDOW_DAYS,
 ) -> dict[str, np.ndarray]:
     f_expert, f_weather = features(dates, p), features(dates, p, w)
     return {
         "naive": np.array([naive_forecast(dates, p, t) for t in targets]),
         "expert": np.array([ols_forecast(f_expert, p, t, window) for t in targets]),
-        "expert_weather": np.array([ols_forecast(f_weather, p, t, window) for t in targets]),
+        "expert_weather": np.array(
+            [ols_forecast(f_weather, p, t, window, shared) for t in targets]
+        ),
     }
 
 
 def forecast_periods(
     pw: pd.DataFrame, window: int = WINDOW_DAYS, first_index: int | None = None
 ) -> pd.DataFrame:
-    dates, p, w, slots = slot_arrays(pw)
+    dates, p, w, shared, slots = slot_arrays(pw)
     first_index = first_eval(window) if first_index is None else first_index
     targets = range(first_index, len(dates))
-    fc = forecast_slots(dates, p, w, targets, window)
+    fc = forecast_slots(dates, p, w, shared, targets, window)
     first = dates[first_index]
     out = pw.loc[pw["delivery_date"] >= first, PRICE_COLUMNS].reset_index(drop=True)
     for m in MODELS:
@@ -545,9 +600,20 @@ def run(data_dir: Path) -> dict:
             "naive": "on a holiday, same slot on the most recent Sunday before D; otherwise"
             " same slot on D-7 for Monday, Saturday and Sunday, on D-1 for the other weekdays",
             "expert": list(EXPERT_FEATURES),
-            "expert_weather": list(EXPERT_FEATURES + WEATHER_FEATURES),
+            "expert_weather": {
+                "per_hour": list(EXPERT_FEATURES + WEATHER_FEATURES),
+                "shared_by_all_hours": list(SHARED_WEATHER_FEATURES),
+            },
         },
-        "estimation": "numpy.linalg.lstsq per slot, refitted for every day",
+        "estimation": "least squares (numpy.linalg.lstsq) per local hour, each pooling the four"
+        " quarter-hours of that hour over the window, refitted for every day; in expert_weather"
+        " the radiation terms have one coefficient for all 24 hours, fitted jointly with the"
+        " per-hour coefficients (Frisch-Waugh-Lovell: partial each hour's regressors out of the"
+        " radiation terms and the price, fit the shared coefficients on the pooled residuals,"
+        " then refit each hour on the price net of the radiation terms)",
+        "radiation_change": "per delivery day, from the national mean radiation of the day's UTC"
+        " hours: half of the next hour's mean minus the previous hour's; at the first and last"
+        " hour of the day, the one-sided difference within the day",
         "holidays": {
             "rule": "treated as a Sunday: the Sunday dummy is 1 and the Monday and Saturday"
             " dummies 0; the naive forecast copies the most recent Sunday before D",

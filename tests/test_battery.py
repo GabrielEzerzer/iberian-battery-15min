@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from ib15 import battery
 from ib15.battery import (
     BOOT_RESAMPLES,
     DT_15MIN,
@@ -57,13 +58,15 @@ def simulate(c, d, dt, energy):
     return SOC_START * energy + np.cumsum(ETA * c * dt - d * dt / ETA)
 
 
+def test_the_battery_starts_and_ends_each_day_empty():
+    assert SOC_START == 0.0
+
+
 def test_two_quarter_hours_hand_solved_fill_at_0_then_empty_back_to_the_start_at_100():
     energy = 0.1
     r = solve_day([0.0, 100.0], DT_15MIN, energy, MAIN)
     stored = energy - SOC_START * energy
-    power_never_binds = (
-        "a 0.1 MWh battery starts with 0.05 MWh; power never binds (0.25 MWh a quarter)"
-    )
+    power_never_binds = "a 0.1 MWh battery starts empty; power never binds (0.25 MWh a quarter)"
     np.testing.assert_allclose(
         r.charge, [stored / (ETA * DT_15MIN), 0], atol=1e-9, err_msg=power_never_binds
     )
@@ -74,7 +77,7 @@ def test_two_quarter_hours_hand_solved_fill_at_0_then_empty_back_to_the_start_at
         r.energy,
         [energy, SOC_START * energy],
         atol=1e-9,
-        err_msg="full at 0, back to 0.05 MWh at 100",
+        err_msg="full at 0, empty again at 100",
     )
     assert r.discharged_mwh == pytest.approx(stored * ETA)
     assert r.gross == pytest.approx(100 * stored * ETA)
@@ -213,13 +216,15 @@ def test_charge_plus_discharge_stays_within_power_at_negative_prices(hours):
     ],
 )
 def test_main_values_from_before_the_shared_power_limit_still_hold_as_it_never_binds(
-    hours, net15, neth
+    hours, net15, neth, monkeypatch
 ):
+    monkeypatch.setattr(battery, "SOC_START", 0.5)
     p = random_day(np.random.default_rng(hours))
     for prices, dt, expected in ((p, DT_15MIN, net15), (hourly(p), DT_HOURLY, neth)):
         r = solve_day(prices, dt, hours, MAIN)
         assert r.net == pytest.approx(expected, rel=1e-7), (
-            "values from the model before c + d <= POWER_MW was added"
+            "values from the model before c + d <= POWER_MW was added, which started each day"
+            " half full"
         )
         assert r.simultaneous == 0, (
             "on these days main never charges and discharges in the same period, so the limit "
@@ -667,12 +672,19 @@ def test_portugal_rows_equal_the_spanish_ones_when_the_prices_are_equal(tmp_path
     data_dir = dataset_dir(tmp_path)
     assert main(["perfect-foresight", "--data-dir", str(data_dir)]) == 0
     out = data_dir / "results"
-    pt = pd.read_csv(out / "perfect_foresight_portugal.csv")
+    table = pd.read_csv(out / "perfect_foresight_portugal.csv")
     summary = pd.read_csv(out / "perfect_foresight_summary.csv")
     unc = pd.read_csv(out / "perfect_foresight_uncertainty.csv")
-    assert list(zip(pt["duration_h"], pt["market"], strict=True)) == [
-        (h, m) for h in DURATIONS_H for m in ("es", "pt")
+    assert list(zip(table["window"], table["duration_h"], table["market"], strict=True)) == [
+        (w, h, m) for w in ("full", "oct_nov_2025") for h in DURATIONS_H for m in ("es", "pt")
     ]
+    full, autumn = (
+        table[table["window"] == w].reset_index(drop=True) for w in ("full", "oct_nov_2025")
+    )
+    assert full.drop(columns="window").equals(autumn.drop(columns="window")), (
+        "all four days fall in October 2025, so the October-November rows are the full rows"
+    )
+    pt = full
     es, pt_rows = pt[pt["market"] == "es"], pt[pt["market"] == "pt"]
     main_rows = summary[summary["spec"] == "main"]
     shared = [c for c in summary.columns if c != "spec"]
@@ -690,6 +702,24 @@ def test_portugal_rows_equal_the_spanish_ones_when_the_prices_are_equal(tmp_path
             assert list(rows[f"{name}_ci_high"]) == list(u["ci_high"]), same_resampled_days
 
 
+def test_the_october_november_rows_use_only_the_days_in_that_window():
+    rng = np.random.default_rng(9)
+    n = 70
+    es = pf_daily(100 + rng.normal(10, 5, n), np.full(n, 100.0))
+    pt = pf_daily(100 + rng.normal(8, 9, n), np.full(n, 100.0))
+    t = portugal(es, pt)
+    autumn = t[t["window"] == "oct_nov_2025"].drop(columns="window").reset_index(drop=True)
+    days_1_oct_to_30_nov = 61
+    first = [d[d["delivery_date"] <= date(2025, 11, 30)] for d in (es, pt)]
+    own = portugal(*first)
+    own = own[own["window"] == "full"].drop(columns="window").reset_index(drop=True)
+    assert (autumn["days"] == days_1_oct_to_30_nov).all()
+    assert (autumn["end"] == date(2025, 11, 30)).all()
+    pd.testing.assert_frame_equal(autumn, own)
+    full = t[t["window"] == "full"]
+    assert (full["days"] == n).all() and (full["end"] == date(2025, 12, 9)).all()
+
+
 def test_portugal_rows_follow_the_portuguese_price():
     rng = np.random.default_rng(5)
     hourly_shape = np.repeat(np.round(rng.uniform(20, 120, 24), 2), 4)
@@ -699,7 +729,8 @@ def test_portugal_rows_follow_the_portuguese_price():
     )
     days = [hourly_shape, spain_flat_at_50_within_each_hour]
     pt_days = [hourly_shape, portugal_alternates_0_and_100_around_the_same_hourly_mean]
-    t = portugal_table(days, pt_days).set_index(["duration_h", "market"])
+    t = portugal_table(days, pt_days)
+    t = t[t["window"] == "full"].set_index(["duration_h", "market"])
     for hours in DURATIONS_H:
         es, pt = t.loc[(hours, "es")], t.loc[(hours, "pt")]
         assert es["net_uplift_eur_per_mw_day"] == pytest.approx(0, abs=1e-6), (
@@ -741,7 +772,8 @@ def test_portugal_intervals_are_the_bootstrap_intervals_of_each_market():
         pf_daily(100 + rng.normal(8, 9, n), np.full(n, 100.0)),
     )
     es, pt = different_daily_uplifts_in_the_two_markets
-    t = portugal(es, pt).set_index(["duration_h", "market"])
+    t = portugal(es, pt)
+    t = t[t["window"] == "full"].set_index(["duration_h", "market"])
     idx = bootstrap_days(n)
     for hours in DURATIONS_H:
         for market, daily in (("es", es), ("pt", pt)):

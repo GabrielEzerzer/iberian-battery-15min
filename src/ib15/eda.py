@@ -3,7 +3,6 @@
 import json
 import math
 import time
-from datetime import date
 from pathlib import Path
 
 import matplotlib
@@ -13,7 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from ib15.battery import DURATIONS_H, _write_all
+from ib15.battery import DURATIONS_H, WINDOWS, _write_all
 from ib15.dataset import BuildError, _git, hourly_benchmark
 from ib15.omie import MADRID
 from ib15.weather import LOCATIONS, VARIABLES
@@ -41,10 +40,6 @@ SEASONS = {
     11: "autumn",
 }
 SEASON_ORDER = ("winter", "spring", "summer", "autumn")
-SPREAD_WINDOWS = {
-    "oct_nov_2025": (date(2025, 10, 1), date(2025, 11, 30)),
-    "full": (None, None),
-}
 WEATHER_LABELS = {
     "temperature_2m": "temperature (°C)",
     "wind_speed_100m": "wind speed at 100 m (m/s)",
@@ -250,7 +245,7 @@ def one_cycle_spread(q: pd.DataFrame) -> pd.DataFrame:
                 "sh": hourly.groupby("delivery_date")[col].agg(lambda p: p.max() - p.min()),
             }
         )
-        for window, (start, end) in SPREAD_WINDOWS.items():
+        for window, (start, end) in WINDOWS.items():
             start = days.index.min() if start is None else start
             end = days.index.max() if end is None else end
             w = days[(days.index >= start) & (days.index <= end)]
