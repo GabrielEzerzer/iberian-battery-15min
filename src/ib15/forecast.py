@@ -620,7 +620,7 @@ def run(data_dir: Path) -> dict:
     figure = fig_example_day(
         example_day_table(chosen, fc),
         chosen,
-        f"{EXAMPLE_MODEL} forecast, 15-minute",
+        "forecast with weather, 15-minute",
         f"{EXAMPLE_DURATION_H} h battery, perfect foresight, {SPEC.name} specification",
     )
 
