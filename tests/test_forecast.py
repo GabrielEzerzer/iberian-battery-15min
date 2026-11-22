@@ -226,6 +226,31 @@ def noise_free(with_weather: bool):
     return dates, p, w, z
 
 
+def test_the_shared_radiation_fit_equals_one_joint_least_squares_fit(long_frame):
+    dates, p, w, z, _ = forecast.slot_arrays(long_frame)
+    t = dates.index(date(2026, 4, 10))
+    assert dates[t - forecast.WINDOW_DAYS] < date(2026, 3, 29) < dates[t], (
+        "the window holds the 92-period day"
+    )
+    f = forecast.features(dates, p, w)
+    got = forecast.ols_forecast(f, p, t, shared=z)
+
+    k, m = f.shape[2], z.shape[2]
+    hour = np.arange(96) // 4
+
+    def design(days):
+        x = np.zeros((len(days), 96, 24 * k + m))
+        for h in range(24):
+            x[:, hour == h, h * k : (h + 1) * k] = f[days][:, hour == h]
+        x[:, :, 24 * k :] = z[days]
+        return x.reshape(-1, 24 * k + m)
+
+    past = np.arange(t - forecast.WINDOW_DAYS, t)
+    coef = np.linalg.lstsq(design(past), p[past].reshape(-1), rcond=None)[0]
+    joint = design(np.array([t])) @ coef
+    np.testing.assert_allclose(got, joint, rtol=1e-9, atol=1e-8)
+
+
 @pytest.mark.parametrize("model", ["expert", "expert_weather"])
 def test_expert_recovers_a_noise_free_equation(model):
     dates, p, w, z = noise_free(model == "expert_weather")
