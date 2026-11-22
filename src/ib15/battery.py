@@ -6,6 +6,7 @@ import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +20,7 @@ POWER_MW = 1.0
 DURATIONS_H = (1, 2, 4)
 RTE = 0.88
 ETA = math.sqrt(RTE)
-SOC_START = 0.5
+SOC_START = 0.0
 DT_15MIN = 0.25
 DT_HOURLY = 1.0
 SIMULTANEOUS_TOL_MW = 1e-6
@@ -54,6 +55,10 @@ BOOT_RESAMPLES = 10_000
 BOOT_SEED = 20251001
 BOOT_PERCENTILES = (2.5, 97.5)
 UNCERTAINTY_STATS = ("net_uplift_eur_per_mw_day", "net_uplift_pct")
+WINDOWS = {
+    "oct_nov_2025": (date(2025, 10, 1), date(2025, 11, 30)),
+    "full": (None, None),
+}
 
 
 class SolveError(Exception):
@@ -279,16 +284,31 @@ def uncertainty(daily: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def in_window(daily: pd.DataFrame, window: str) -> pd.DataFrame:
+    start, end = WINDOWS[window]
+    d = daily["delivery_date"]
+    start = d.min() if start is None else start
+    end = d.max() if end is None else end
+    return daily[(d >= start) & (d <= end)]
+
+
 def portugal(daily: pd.DataFrame, daily_pt: pd.DataFrame) -> pd.DataFrame:
-    idx = bootstrap_days(daily["delivery_date"].nunique())
     rows = []
-    for hours in DURATIONS_H:
-        for market, frame in (("es", daily), ("pt", daily_pt)):
-            row = {"duration_h": hours, "market": market} | _compare(frame, hours, MAIN_SPEC)
-            stats = uplift_statistics(frame, hours, MAIN_SPEC.name, idx)
-            for name in UNCERTAINTY_STATS:
-                row[f"{name}_ci_low"], row[f"{name}_ci_high"] = interval(stats[name])
-            rows.append(row)
+    for window in ("full", *(w for w in WINDOWS if w != "full")):
+        es, pt = in_window(daily, window), in_window(daily_pt, window)
+        days = es["delivery_date"]
+        if days.empty:
+            continue
+        idx = bootstrap_days(days.nunique())
+        span = {"window": window, "start": days.min(), "end": days.max()}
+        for hours in DURATIONS_H:
+            for market, frame in (("es", es), ("pt", pt)):
+                row = span | {"duration_h": hours, "market": market}
+                row |= _compare(frame, hours, MAIN_SPEC)
+                stats = uplift_statistics(frame, hours, MAIN_SPEC.name, idx)
+                for name in UNCERTAINTY_STATS:
+                    row[f"{name}_ci_low"], row[f"{name}_ci_high"] = interval(stats[name])
+                rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -396,6 +416,10 @@ def perfect_foresight(data_dir: Path) -> dict:
         "days": int(daily["delivery_date"].nunique()),
         "uncertainty": bootstrap_meta() | {"statistics": list(UNCERTAINTY_STATS)},
         "portugal_spec": MAIN_SPEC.name,
+        "portugal_windows": {
+            w: {"start": None if a is None else str(a), "end": None if b is None else str(b)}
+            for w, (a, b) in WINDOWS.items()
+        },
         "portugal_price_agreement": price_agreement(q),
         "solve_seconds": round(time.perf_counter() - started, 1),
         "git_commit": _git("rev-parse", "HEAD"),

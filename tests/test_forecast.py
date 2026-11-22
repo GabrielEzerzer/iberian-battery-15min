@@ -23,6 +23,8 @@ OUTPUTS = {
     "forecast_uncertainty.csv",
     "forecast_regret_drivers.csv",
     "forecast_meta.json",
+    "fig_example_day.png",
+    "fig_example_day.pdf",
 }
 
 
@@ -56,9 +58,9 @@ def long_frame():
 
 
 def forecast_for(pw: pd.DataFrame, day: date) -> dict[str, np.ndarray]:
-    dates, p, w, slots = forecast.slot_arrays(pw)
+    dates, p, w, z, slots = forecast.slot_arrays(pw)
     t = dates.index(day)
-    fc = forecast.forecast_slots(dates, p, w, [t])
+    fc = forecast.forecast_slots(dates, p, w, z, [t])
     return {m: fc[m][0][slots[t]] for m in MODELS}
 
 
@@ -112,12 +114,12 @@ def test_window_reaches_back_exactly_63_days(long_frame):
 
 @pytest.mark.parametrize("window", forecast.SENSITIVITY_WINDOWS)
 def test_each_sensitivity_window_reaches_back_exactly_its_length_plus_7_days(long_frame, window):
-    dates, p, w, _ = forecast.slot_arrays(long_frame)
+    dates, p, w, z, _ = forecast.slot_arrays(long_frame)
     t = dates.index(date(2026, 1, 14))
     reach = window + 7
 
     def expert(prices):
-        fc = forecast.forecast_slots(dates, prices, w, [t], window)
+        fc = forecast.forecast_slots(dates, prices, w, z, [t], window)
         return fc["expert"][0], fc["expert_weather"][0]
 
     base = expert(p)
@@ -160,7 +162,7 @@ def test_naive_rule(long_frame, day, lag):
     ],
 )
 def test_a_holiday_has_the_sunday_dummies(long_frame, day, dummies):
-    dates, p, w, _ = forecast.slot_arrays(long_frame)
+    dates, p, w, _, _ = forecast.slot_arrays(long_frame)
     cols = [forecast.EXPERT_FEATURES.index(k) for k in ("Monday", "Saturday", "Sunday")]
     for f in (forecast.features(dates, p), forecast.features(dates, p, w)):
         row = f[dates.index(day)][:, cols]
@@ -179,24 +181,34 @@ def test_the_holiday_list():
     )
 
 
+def per_hour(a: np.ndarray) -> np.ndarray:
+    return np.repeat(a, 4, axis=0)
+
+
 def noise_free(with_weather: bool):
     rng = np.random.default_rng(1)
     n = 70
     dates = [date(2025, 11, 3) + timedelta(days=i) for i in range(n)]
     p = np.zeros((n, 96))
     p[:7] = rng.uniform(20, 120, (7, 96))
-    beta = np.column_stack(
-        [
-            rng.uniform(-5, 5, 96),
-            rng.uniform(0.3, 0.5, 96),
-            rng.uniform(-0.2, 0.2, 96),
-            rng.uniform(0.3, 0.45, 96),
-            rng.uniform(-0.1, 0.1, (96, 3)),
-            rng.uniform(-10, 10, (96, 3)),
-        ]
+    one_coefficient_per_hour_for_its_four_quarters = per_hour(
+        np.column_stack(
+            [
+                rng.uniform(-5, 5, 24),
+                rng.uniform(0.3, 0.5, 24),
+                rng.uniform(-0.2, 0.2, 24),
+                rng.uniform(0.3, 0.45, 24),
+                rng.uniform(-0.1, 0.1, (24, 3)),
+                rng.uniform(-10, 10, (24, 3)),
+                rng.uniform(-8, 8, (24, 3)),
+            ]
+        )
     )
-    w = rng.normal(size=(n, 96, 3)) * [5, 3, 200] + [15, 6, 200]
-    gamma = rng.uniform(-1, 1, (96, 3)) * [1, 1, 0.05]
+    w = rng.normal(size=(n, 96, 2)) * [5, 3] + [15, 6]
+    gamma = per_hour(rng.uniform(-1, 1, (24, 2)))
+    z = rng.normal(size=(n, 96, 2)) * [200, 50] + [200, 0]
+    one_radiation_coefficient_for_all_hours = np.array([-0.05, 0.02])
+    quarter = np.arange(96) % 4
     for j in range(7, n):
         prev = p[j - 1]
         weekday_a_holiday_has_the_sunday_dummies = (
@@ -206,17 +218,115 @@ def noise_free(with_weather: bool):
             [np.ones(96), prev, p[j - 2], p[j - 7]]
             + [np.full(96, v) for v in (prev.min(), prev.max(), prev[-1])]
             + [np.full(96, float(weekday_a_holiday_has_the_sunday_dummies == k)) for k in (0, 5, 6)]
+            + [(quarter == k).astype(float) for k in (1, 2, 3)]
         )
-        p[j] = (x * beta).sum(axis=1) + ((w[j] * gamma).sum(axis=1) if with_weather else 0)
-    return dates, p, w
+        p[j] = (x * one_coefficient_per_hour_for_its_four_quarters).sum(axis=1)
+        if with_weather:
+            p[j] += (w[j] * gamma).sum(axis=1) + z[j] @ one_radiation_coefficient_for_all_hours
+    return dates, p, w, z
+
+
+def test_the_shared_radiation_fit_equals_one_joint_least_squares_fit(long_frame):
+    dates, p, w, z, _ = forecast.slot_arrays(long_frame)
+    t = dates.index(date(2026, 4, 10))
+    assert dates[t - forecast.WINDOW_DAYS] < date(2026, 3, 29) < dates[t], (
+        "the window holds the 92-period day"
+    )
+    f = forecast.features(dates, p, w)
+    got = forecast.ols_forecast(f, p, t, shared=z)
+
+    k, m = f.shape[2], z.shape[2]
+    hour = np.arange(96) // 4
+
+    def design(days):
+        x = np.zeros((len(days), 96, 24 * k + m))
+        for h in range(24):
+            x[:, hour == h, h * k : (h + 1) * k] = f[days][:, hour == h]
+        x[:, :, 24 * k :] = z[days]
+        return x.reshape(-1, 24 * k + m)
+
+    past = np.arange(t - forecast.WINDOW_DAYS, t)
+    coef = np.linalg.lstsq(design(past), p[past].reshape(-1), rcond=None)[0]
+    joint = design(np.array([t])) @ coef
+    np.testing.assert_allclose(got, joint, rtol=1e-9, atol=1e-8)
 
 
 @pytest.mark.parametrize("model", ["expert", "expert_weather"])
 def test_expert_recovers_a_noise_free_equation(model):
-    dates, p, w = noise_free(model == "expert_weather")
+    dates, p, w, z = noise_free(model == "expert_weather")
     targets = [forecast.FIRST_EVAL, len(dates) - 1]
-    got = forecast.forecast_slots(dates, p, w, targets)[model]
+    got = forecast.forecast_slots(dates, p, w, z, targets)[model]
     np.testing.assert_allclose(got, p[targets], rtol=1e-9, atol=1e-8)
+
+
+def test_an_hour_dark_through_the_window_does_not_extrapolate_when_the_clock_brings_sun():
+    rng = np.random.default_rng(4)
+    n = forecast.FIRST_EVAL + 1
+    dates = [date(2026, 1, 5) + timedelta(days=i) for i in range(n)]
+    hour_19 = slice(76, 80)
+    hourly_sun = np.clip(np.sin(np.pi * (np.arange(96) - 32) / 40), 0, None)
+    rad = 600 * hourly_sun * rng.uniform(0.3, 1, (n, 1))
+    rad[:, hour_19] = rng.uniform(0, 0.5, (n, 4))
+    spring_forward_puts_19_00_an_hour_earlier_in_the_sun = 147.0
+    rad[-1, hour_19] = spring_forward_puts_19_00_an_hour_earlier_in_the_sun
+    slope = -0.1
+    base = per_hour(rng.uniform(40, 80, 24))
+    p = base + slope * rad + rng.normal(0, 5, (n, 96))
+    w = rng.normal(size=(n, 96, 2)) * [5, 3] + [15, 6]
+    z = np.stack([rad, np.zeros_like(rad)], axis=2)
+    got = forecast.forecast_slots(dates, p, w, z, [n - 1])["expert_weather"][0]
+    expected = base[hour_19] + slope * spring_forward_puts_19_00_an_hour_earlier_in_the_sun
+    np.testing.assert_allclose(
+        got[hour_19],
+        expected,
+        atol=15,
+        err_msg="a radiation slope fitted on one hour's near-zero values would extrapolate to"
+        " hundreds of EUR/MWh; the slope shared by all hours gives about base - 0.1 * 147",
+    )
+
+
+def test_the_radiation_change_is_centred_inside_the_day_and_one_sided_at_its_edges():
+    hourly = np.array([0.0, 100.0, 300.0, 300.0, 250.0])
+    got = forecast.radiation_ramp(np.repeat(hourly, 4))
+    np.testing.assert_allclose(got, np.repeat([100.0, 150.0, 100.0, -25.0, -50.0], 4))
+
+
+def test_the_radiation_change_is_tilted_by_the_quarters_position_in_the_hour(long_frame):
+    day = date(2026, 1, 14)
+    pw = long_frame.copy()
+    rows = pw["delivery_date"] == day
+    ghi = [c for c in WX_COLS if c.startswith("ghi_")]
+    hour = (pw.loc[rows, "period"].to_numpy() - 1) // 4
+    pw.loc[rows, ghi] = np.repeat((10.0 * hour**2)[:, None], len(ghi), axis=1)
+    dates, _, _, z, _ = forecast.slot_arrays(pw)
+    rad, tilt = z[dates.index(day)].T
+    np.testing.assert_allclose(rad, np.repeat(10.0 * np.arange(24) ** 2, 4))
+    change = np.gradient(10.0 * np.arange(24) ** 2)
+    np.testing.assert_allclose(tilt, np.repeat(change, 4) * np.tile([-1.5, -0.5, 0.5, 1.5], 24))
+
+
+def test_the_example_day_has_the_median_perfect_foresight_1_h_uplift():
+    uplifts = {date(2026, 1, d): u for d, u in ((1, 9.0), (2, 1.0), (3, 5.0), (4, 3.0), (5, 7.0))}
+    rows = [
+        {
+            "delivery_date": day,
+            "duration_h": hours,
+            "model": model,
+            "resolution": res,
+            "net_eur_per_mw": 100.0 + (u if res == "15min" else 0.0) * (model == "perfect"),
+        }
+        for day, u in uplifts.items()
+        for hours in battery.DURATIONS_H
+        for model in ("perfect", *MODELS)
+        for res in ("15min", "hourly")
+    ]
+    assert forecast.example_day(pd.DataFrame(rows)) == date(2026, 1, 3), (
+        "uplifts 9, 1, 5, 3, 7: the median is 5, on 3 January"
+    )
+    even = pd.DataFrame([r for r in rows if r["delivery_date"] != date(2026, 1, 5)])
+    assert forecast.example_day(even) == date(2026, 1, 4), (
+        "uplifts 9, 1, 5, 3: the lower middle day is the one at 3"
+    )
 
 
 def test_dst_days_map_to_96_slots_and_back():
@@ -449,6 +559,8 @@ def test_run_writes_every_output(tmp_path):
     )
     fc = pd.read_parquet(out / "forecasts_15min.parquet")
     assert fc["delivery_date"].nunique() == days and set(MODELS) <= set(fc.columns)
+    daily = pd.read_parquet(out / "forecast_value_daily.parquet")
+    assert meta["example_day"]["date"] == str(forecast.example_day(daily))
     pw = pd.read_parquet(tmp_path / "dataset" / "prices_weather_15min.parquet")
     for day, lag in ((date(2025, 12, 5), 1), (date(2025, 12, 6), 6), (date(2025, 12, 7), 7)):
         got = fc.loc[fc["delivery_date"] == day, "naive"].to_numpy()
